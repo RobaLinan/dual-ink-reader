@@ -8,25 +8,30 @@
 #include <stdio.h>
 
 // === 排版常量：按像素宽计量（DESIGN §5.5 中英混排）===
+// 画布是竖版页 EinkPanel::PAGE_W(480) × PAGE_H(648)（短边为横边），由
+// PAGE_ROTATE 旋转进 648×480 显存 —— 这里的行宽/页底全按竖版页逻辑坐标算。
 static const int TXT_X       = 8;
 static const int TXT_Y0      = 32;   // 页眉(8+16) + 分隔线(26) 之下
-static const int HARD_PX     = 632;  // 硬上限（档位无关）：8+632 ≤ 640 < 648 不越界
-                                    //   （Paint_SetPixel 边界判断是 > 不是 ≥）
+static const int HARD_PX     = EinkPanel::PAGE_W - 16;  // 硬上限（档位无关）：8+464=472，
+                                    //   末像素 471 < 480 不越界
+                                    //   （Paint_SetPixel 边界判断是 > 不是 ≥，
+                                    //    逻辑 x=480 会写穿显存行缓冲）
 static const int MAXTOK      = 64;   // 单行 token 上限（实算 ≤45，防御）
 
 // 三档字号的运行期参数（TxtBook::setTier 设置）：
-//   S(16): Font16 原生 + Unifont16 | 行高18 24行 | 软 632-16=616
-//   M(24): Font24 原生 + Unifont1.5× | 行高28 15行 | 软 632-24=608
-//   L(32): Font16 2× + Unifont 2×  | 行高36 12行 | 软 632-32=600
-//   软预算 = HARD_PX - s_cjkPx：给避头悬挂留出最大字宽，悬挂后仍 ≤632。
+//   S(16): Font16 原生 + Unifont16 | 行高18 33行 | 软 464-16=448
+//   M(24): Font24 原生 + Unifont1.5× | 行高28 21行 | 软 464-24=440
+//   L(32): Font16 2× + Unifont 2×  | 行高36 16行 | 软 464-32=432
+//   （行数由 updateGeometry 按 TXT_BOT/TXT_Y0/档宽算，换页高只动 TXT_BOT）
+//   软预算 = HARD_PX - s_cjkPx：给避头悬挂留出最大字宽，悬挂后仍 ≤464。
 //   家族包模式（CJK.packActive()）下行几何另算：行距按包的基线/行盒度量，
 //   软预算按包 maxAdv；步进逐字取真实 advance（proportional）。
 static int s_asciiPx = 11, s_cjkPx = 16;
-static int s_linePx  = 616;          // 软预算
+static int s_linePx  = 448;          // 软预算
 static int s_lineH   = 18;           // 行高
-static int s_maxline = 24;           // 每页行数
+static int s_maxline = 33;           // 每页行数
 static int s_asciiMode = 1;          // 0=Font24 原生 / 1=Font16 原生 / 2=Font16 2× 放大
-static const int TXT_BOT = 462;      // 正文墨迹底界（页底留 18px 余量）
+static const int TXT_BOT = EinkPanel::PAGE_H - 18;   // 正文墨迹底界（页底留 18px 余量）
 
 // 行缓冲 = UTF-8 字节流；token 表记每段的起点/前缀像素宽/文件位置（页尾回退用）
 static char s_line[256];
@@ -283,24 +288,27 @@ static bool placeWord(const char* w, int len, uint32_t wStart) {
 }
 
 // ---- TxtBook ----
-// 行几何随字号档 + 家族联动：classic 用档位表；家族包用包内基线/行盒/maxAdv 度量
+// 行几何随字号档 + 家族联动：classic 用档位表；家族包用包内基线/行盒/maxAdv 度量。
+// 每页行数统一按墨迹盒算（换页高只动 TXT_BOT）：
+//   n = (TXT_BOT - TXT_Y0 - 盒高) / 行高 + 1   —— 横版 462 时正好还原 24/15/12
 static void updateGeometry() {
+  int box;   // 行内墨迹盒高：classic = 档位字高；家族包 = 基线 + 最大下伸
   if (CJK.packActive()) {
-    int box = CJK.baselineY() + CJK.maxDescent();   // 墨迹行盒（上伸+下伸）
+    box = CJK.baselineY() + CJK.maxDescent();
     s_lineH = box + s_cjkPx / 8;                    // 行距 16→+2 / 24→+3 / 32→+4
-    int n = (TXT_BOT - TXT_Y0 - box) / s_lineH + 1;
-    s_maxline = n > 0 ? n : 1;
-    // 软预算与 classic 同规则：悬挂路径另有 <=HARD_PX 显式检查兜底，
-    // 不必按包 maxAdv 收缩（U+2E3B 三倍宽破折号那种 78px 特例会白扔行宽）
-    s_linePx = HARD_PX - s_cjkPx;
   } else {
+    box = s_cjkPx;
     switch (s_cjkPx) {
-      case 24: s_lineH = 28; s_maxline = 15; break;
-      case 32: s_lineH = 36; s_maxline = 12; break;
-      default: s_lineH = 18; s_maxline = 24; break;
+      case 24: s_lineH = 28; break;
+      case 32: s_lineH = 36; break;
+      default: s_lineH = 18; break;
     }
-    s_linePx = HARD_PX - s_cjkPx;
   }
+  int n = (TXT_BOT - TXT_Y0 - box) / s_lineH + 1;
+  s_maxline = n > 0 ? n : 1;
+  // 软预算与 classic 同规则：悬挂路径另有 <=HARD_PX 显式检查兜底，
+  // 不必按包 maxAdv 收缩（U+2E3B 三倍宽破折号那种 78px 特例会白扔行宽）
+  s_linePx = HARD_PX - s_cjkPx;
 }
 
 void TxtBook::setTier(uint8_t sizePx) {
@@ -416,20 +424,31 @@ void TxtBook::setTitle(const char* t) {
   }
 }
 
+// 页眉混排（文件名可能带中文），固定 Font16 / 16px 不随档位。
+// 竖版页只有 480px 宽（长文件名+页码放不下）：放不下就截断 —— 逻辑 x=480 会
+// 写穿显存（Paint_SetPixel 边界是 > 不是 ≥，旋转后 x 映射成显存行号）
+static void drawHeader(const char* hdr) {
+  int i = 0, x = TXT_X;
+  while (hdr[i]) {
+    int u;
+    uint32_t cp = utf8At(hdr + i, (int)strlen(hdr) - i, &u);
+    int adv = cp < 0x80 ? 11 : 16;
+    if (x + adv > EinkPanel::PAGE_W) break;   // 末像素 ≤479 才画
+    if (cp < 0x80) Paint_DrawChar(x, 8, (char)cp, &Font16, BLACK, WHITE);
+    else CJK.drawGlyph(x, 8, cp, 16);
+    x += adv;
+    i += u;
+  }
+}
+
 // 空白页（页眉+分隔线，正文全白）：EPUB 章节在右页中间结束
 void TxtBook::renderBlank(uint8_t* fb, uint32_t pageNo) {
   Paint_SelectImage(fb);
   Paint_Clear(WHITE);
   char hdr[48];
   snprintf(hdr, sizeof(hdr), "%s   page %lu", m_title, (unsigned long)pageNo);
-  { int i = 0, x = TXT_X;
-    while (hdr[i]) {
-      int u; uint32_t cp = utf8At(hdr + i, (int)strlen(hdr) - i, &u);
-      if (cp < 0x80) { Paint_DrawChar(x, 8, (char)cp, &Font16, BLACK, WHITE); x += 11; }
-      else { CJK.drawGlyph(x, 8, cp, 16); x += 16; }
-      i += u;
-    } }
-  Paint_DrawLine(TXT_X, 26, EinkPanel::WIDTH - 1 - TXT_X, 26,
+  drawHeader(hdr);
+  Paint_DrawLine(TXT_X, 26, EinkPanel::PAGE_W - 1 - TXT_X, 26,
                  BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
 }
 
@@ -443,14 +462,8 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
 
   char hdr[48];
   snprintf(hdr, sizeof(hdr), "%s   page %lu", m_title, (unsigned long)pageNo);
-  { int i = 0, x = TXT_X;                       // 页眉也走混排（文件名可能带中文）
-    while (hdr[i]) {
-      int u; uint32_t cp = utf8At(hdr + i, (int)strlen(hdr) - i, &u);
-      if (cp < 0x80) { Paint_DrawChar(x, 8, (char)cp, &Font16, BLACK, WHITE); x += 11; }
-      else { CJK.drawGlyph(x, 8, cp, 16); x += 16; }   // 页眉固定 16px 小字，不随档位
-      i += u;
-    } }
-  Paint_DrawLine(TXT_X, 26, EinkPanel::WIDTH - 1 - TXT_X, 26,
+  drawHeader(hdr);                              // 页眉也走混排（文件名可能带中文）
+  Paint_DrawLine(TXT_X, 26, EinkPanel::PAGE_W - 1 - TXT_X, 26,
                  BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
 
   m_hitEof = false;

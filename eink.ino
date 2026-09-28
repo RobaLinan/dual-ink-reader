@@ -11,6 +11,9 @@
 // 节奏：每 5 次快刷插 1 次全刷（DESIGN §5.9 = Diptyx partialUpdatesRemaining=5）；
 // 降级链：右屏超时→单屏刷，SD/书失败→页码 demo，都不挡测试。
 //
+// 页面方向：竖版 480×648（短边为横边），PAGE_ROTATE=90 旋转进 648×480 显存
+// （页顶朝屏右边 = 阅读时设备逆时针转 90°；宏见 src/EinkPanel.h）
+//
 // P4 书库/进度：开机扫 /books/*.txt + *.epub 成书库（串口 b 切下一本）；
 // 进度（路径+位置+页号+章号）存 NVS，每对页翻完/切书/深睡时写，开机按存档恢复。
 
@@ -302,7 +305,10 @@ void setup() {
 
   // GUI_Paint 必须先 NewImage：不调用时 Width/Height/Scale 全是 0，
   // Paint_Clear 空转、所有绘制被边界检查丢弃（P1 花屏的根因）
-  Paint_NewImage(fbShownL, EinkPanel::WIDTH, EinkPanel::HEIGHT, ROTATE_0, WHITE);
+  // 竖版页在这里定方向：显存仍 648×480 横版，逻辑画布 480×648（PAGE_W×PAGE_H），
+  // 旋转由 Paint_SetPixel 逐像素完成。之后各画布只 Paint_SelectImage 切换，
+  // 宽高/旋转保持这次 NewImage 的设置（几何参数跟着 buffer 走是错的，别改回 0）
+  Paint_NewImage(fbShownL, EinkPanel::WIDTH, EinkPanel::HEIGHT, PAGE_ROTATE, WHITE);
 
   if (!left.begin()) {
     Serial.println("FATAL: left panel begin() BUSY timeout - check wiring");

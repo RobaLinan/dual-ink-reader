@@ -1,4 +1,5 @@
 #include "CjkFont.h"
+#include "EinkPanel.h"   // 竖版页逻辑边界 PAGE_W/PAGE_H
 #include "Storage.h"
 #include "SD_MMC.h"
 #include <ESP32epdx.h>   // Paint_SetPixel / BLACK
@@ -293,8 +294,9 @@ void CjkFont::drawGlyph(int x, int y, uint32_t cp, int size) {
         if (!(line[col >> 3] & (0x80 >> (col & 7)))) continue;
         int px = x0 + col, py = y0 + row;
         // ink 可能比 adv 宽（悬挂极值）：自兜底，Paint_SetPixel 的边界判断是
-        // > 不是 ≥，x=648/y=480 会写穿行缓冲
-        if (px > 647 || py > 479) continue;
+        // > 不是 ≥，逻辑 x=480/y=648 会写穿显存行缓冲（坐标是竖版页的，
+        // 旋转映射后 x→显存行、y→显存列，SetPixel 自己的边界检查拦不住）
+        if (px > EinkPanel::PAGE_W - 1 || py > EinkPanel::PAGE_H - 1) continue;
         Paint_SetPixel(px, py, BLACK);
       }
     }

@@ -60,6 +60,18 @@ SD 卡（SDMMC 1-bit，4-bit 实测不稳，见 §5.7）：
    对照 Diptyx `DisplayPictureBoth()`，同一形状；单屏串行 2×1.3s → 重叠 ≈max+60ms
 5. `mirrored=true`：流式发送时做字节序反转+位反转（右屏物理倒装）
 6. BUSY 高电平 = 空闲（此模组极性，与 vendor 注释 "=0 BUSY" 一致）
+7. **页面方向（2026-09-28 改：短边为横边的竖版页）**：屏恒是 648×480 横版
+   显存，排版则按竖版页 `PAGE_W`(480) × `PAGE_H`(648) 走。旋转不自己拷缓冲，
+   交给 `Paint_NewImage(..., PAGE_ROTATE)` —— GUI_Paint 的 `Paint_SetPixel`
+   逐像素做坐标映射（**90 = 页顶朝屏右边**，阅读时把设备逆时针转 90°；
+   270 = 反向，改 `EinkPanel.h` 的 `PAGE_ROTATE` 或编译加 `-DPAGE_ROTATE=270`）。
+   所有绘制（`Paint_Draw*` + `CJK.drawGlyph`）都经 `Paint_SetPixel`，所以零额外
+   缓冲、零旋转拷贝；差分/DTM1/`mirrored` 仍在显存坐标上原样工作。
+   ⚠️ 代价：`Paint_SetPixel` 边界判断是 `>` 不是 `≥`，**逻辑 x=480 会写穿显存**
+   （旋转后 x→显存行号，SetPixel 内部拦不住）→ 三处钳位是硬需求：页眉超长
+   截断（`TxtBook::drawHeader`）、行宽硬上限 464（`HARD_PX = PAGE_W-16`）、
+   CJK ink 出界丢弃（`CjkFont::drawGlyph`）。离屏回归见 §6
+   `tools/rot_layout_test.cpp`（哨兵带验证最坏排版零越界 + 反例确认 x=480 必穿）。
 
 **P1 实测数据**（eink.ino demo，串口 115200，ESP32-S3 实测 2026-09-23）：
 ```
@@ -161,27 +173,30 @@ shown 永远 = 屏上真实内容）。
    8×16 半宽左对齐补零到 16 列；辅助平面 66225 条 BMP 之外跳过；缺字画 16×16
    空心方框区分"缺字/空白"）。`CjkFont` 优先整块 ps_malloc 进 PSRAM，失败回退
    逐字形 SD seek+read。排版按像素宽：ASCII 11px / CJK 16px / 空格 11px，
-   软预算 616px（对齐旧 56 列），硬上限 632px（`Paint_SetPixel` 边界是 `>`
-   不是 `≥`，x=648 会越界 → 悬挂吞右边距也绝不能超 632）。断行四层：
+   **竖版页 480 宽**（方向见 §3.7）：软预算 448px，硬上限 464px（`PAGE_W-16`，
+   `Paint_SetPixel` 边界是 `>` 不是 `≥`，逻辑 x=480 会写穿显存 → 悬挂吞右边距
+   也绝不能超 464）。断行四层：
    避头悬挂 → 上一 token 推挤到下一行同行（携带的前导空格剥离并恢复原
    pendingSpace）→ 普通换行 → 超长词 cutPoint 硬切。西文弯引号/长横线仍归一
    ASCII 走 Font16，英文行宽与旧版一致（不回退）。`Font12CN/Font24CN` 只有
    extern 无定义，链接不过 —— 不可用。
    **三档字号（2026-09-24 增）**：`TxtBook::setTier(16/24/32)`，默认档改
    `TxtBook.h` 的 `TXT_SIZE_PX` 再编译（P6 4 键落地后可运行期切）。S=Font16 原生
-   11px+Unifont16/行高18/24行；M=Font24 原生 17px+Unifont 1.5× 最近邻/28/15行
-   （笔画略参差，可接受）；L=Font16 点阵 2× 放大 22px+Unifont 2×/36/12行（整齐）。
-   软行宽 = 632−汉字档宽（616/608/600），悬挂后仍 ≤632 不越屏；缺字方框随档
-   1px/2px 加粗。页眉固定 16px 不随档位。
+   11px+Unifont16/行高18/33行；M=Font24 原生 17px+Unifont 1.5× 最近邻/28/21行
+   （笔画略参差，可接受）；L=Font16 点阵 2× 放大 22px+Unifont 2×/36/16行（整齐）。
+   行数不再写死，`updateGeometry()` 按 `TXT_BOT(=PAGE_H-18)` 与墨迹盒算（换页高
+   只动 `TXT_BOT`）。软行宽 = 464−汉字档宽（448/440/432），悬挂后仍 ≤464 不越屏；
+   缺字方框随档 1px/2px 加粗。页眉固定 16px 不随档位，长文件名在 `drawHeader()`
+   按 480 宽截断。
    **字体自定义（2026-09-24 增，Kindle 式）**：家族包 `font-<名>-<档>.bin`（EPF1）
    离线从任意 TTF 光栅化（`tools/mk_fontpack.py`），拉丁带真实 advance（比例宽度），
    汉字/全角等宽；一笔紧凑 ink（cp/adv/xy 偏移/w/h/bits），PSRAM 整包 → heap →
    SD 桶缓存三级装载，查表走 u32[257] 桶索引线性扫（≤256 条）。缺字回退：
    家族包 → Unifont（对齐包基线）→ 方框。行几何随包度量联动（基线/行盒/行距
-   = 盒+档宽/8）；软预算与 classic 同为 632−档宽（悬挂另有显式 HARD 检查兜底）。
+   = 盒+档宽/8）；软预算与 classic 同为 464−档宽（悬挂另有显式 HARD 检查兜底）。
    切换：串口 `f`=换家族 `s`=换字号（P6 4 键落地后绑同一接口），选择存 NVS 断电保留；
    `restartPair()` 回跳当前对页立即重排 = 切换即预览。家族 classic/serif/sans/kai
-   四款全就绪（kai=霞鹜文楷 43433 字形，2026-09-24）。 ink 出界自兜底（x≤647/y≤479，Paint 边界是 > 不是 ≥）。
+   四款全就绪（kai=霞鹜文楷 43433 字形，2026-09-24）。 ink 出界自兜底（竖版页逻辑 x≤479/y≤647，Paint 边界是 > 不是 ≥）。
 6. EPUB >280KB 章节崩分配器（atomic14 #73）→ 先解压到临时文件再流式（坑 18 后 = 片内 LittleFS）
 7. SDMMC × core 2.0.17 × S3 兼容性 → **P3 首验（2026-09-21）：4-bit 不稳定，定案 1-bit @20MHz；写 2MB / 1417ms ≈ 1.41MB/s**。**二验（2026-09-24）：正式引脚 38/39/40 挂载成功，/test.txt(151KB) 流式分页正常（24 行/页，读+渲染 ~30ms/页，对比 1.3s 刷屏可忽略）**。
    ⚠️ 踩坑：初始化 `0x107`（卡无应答）→ **CMD/D0 需要内部上拉兜底**（`pinMode(INPUT_PULLUP)` 再 `setPins`）——模块没焊总线上拉时 CMD 浮空；8.21 的 one_bit_write 带这两行、初版 Storage 漏抄。D1/D2/D3 悬空无妨（1-bit 用不到）。
@@ -193,9 +208,10 @@ shown 永远 = 屏上真实内容）。
 9. 残影 → 每 5 次快刷插一次全刷
 10. `0xE5` 强制温度 → 对比度略降；后续用面板温度传感器（0x40 TSC/0x43 TSR）补偿
 11. 结构装配时 USB 座外壳通孔必须焊/固定，否则连焊盘撕掉（Open Book 教训）
-12. GUI_Paint 用前必须 `Paint_NewImage(buf, W, H, ROTATE_0, WHITE)`，之后各画布只
+12. GUI_Paint 用前必须 `Paint_NewImage(buf, W, H, PAGE_ROTATE, WHITE)`（W/H 是
+    **显存** 648×480，旋转定竖版页方向，见 §3.7），之后各画布只
     `Paint_SelectImage` 切换 —— 漏了 NewImage 不报错不崩溃，只是全部绘制静默丢弃
-    （P1 花屏根因）
+    （P1 花屏根因）。宽高/旋转只认 NewImage 那一次，SelectImage 只换指针
 13. 右屏 BUSY 用 GPIO48 = DevKitC-1 的 RGB LED 脚：LED DIN 高阻无电气冲突，
     但刷新时 BUSY 信号会让 LED 闪 —— 属正常现象，别当故障查接线
 14. 设计外壳时预留出esp32s3的rst和boot按钮针孔
@@ -262,6 +278,8 @@ shown 永远 = 屏上真实内容）。
 
 ## 6. 本地工具
 - 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default /home/roba/Arduino/eink`
+- 竖版页离屏回归（不接硬件，§3.7）：`GUI=$HOME/Arduino/libraries/ESP32epdx/src/GUI g++ -std=c++17 -I"$GUI" tools/rot_layout_test.cpp "$GUI/GUI_Paint.cpp" "$GUI/font16.cpp" -o /tmp/rot_layout_test && /tmp/rot_layout_test`
+  （断言逻辑画布 480×648、最坏排版零越界、页顶朝右；改动排版常量后跑一下）
 - 字库生成：`python3 tools/mk_unifont.py`（源 `unifont_all.hex` → `assets/fonts/unifont.bin`，已生成）
 - **字库包（字体自定义）**：`python3 tools/mk_fontpack.py <font.ttf> assets/fonts --name <名字>
   [--sizes 16 24 32]` → `assets/fonts/font-<名字>-<档>.bin`（EPF1 格式：紧凑 ink 记录 +

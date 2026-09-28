@@ -17,6 +17,18 @@
 //      本质 = 0x50(CDI) 数据 + 0xE5 强制温度寄存器（假装高温换取快波形）
 //
 // BUSY 极性：此模组高电平 = 空闲（vendor 注释 "=0 BUSY"）。
+//
+// === 页面方向：短边为横边的竖版页（DESIGN §5.5）===
+// 屏是横的 648×480，但排版按竖版页 PAGE_W(480) × PAGE_H(648) 走。所有绘制都
+// 经过 GUI_Paint 的 Paint_SetPixel，而它自带旋转 —— 只要在 Paint_NewImage 时
+// 给 PAGE_ROTATE，逻辑坐标 (0..479, 0..647) 就逐像素映射进 648×480 显存，
+// 零额外缓冲、零旋转拷贝；差分/DTM1/R_MIRRORED 都在显存坐标上做，不受影响。
+//   90  = 页顶朝屏右边（阅读时把设备逆时针转 90°）← 当前
+//   270 = 页顶朝屏左边（顺时针转 90°）
+// 编译期想翻方向：改这里，或 build 时 -DPAGE_ROTATE=270
+#ifndef PAGE_ROTATE
+#define PAGE_ROTATE 90
+#endif
 class EinkPanel {
 public:
   enum Speed : uint8_t { FULL = 0, FAST = 1, PARTIAL = 2 };
@@ -24,6 +36,11 @@ public:
   static const int WIDTH = 648;
   static const int HEIGHT = 480;
   static const uint32_t FULL_BYTES = (uint32_t)WIDTH * HEIGHT / 8;  // 38880
+
+  // 排版用的逻辑页（竖版：短边 480 为横边、长边 648 为竖边），
+  // 由 PAGE_ROTATE 映射进上面的显存 —— 画布尺寸、行宽、页底全按这两个走
+  static const int PAGE_W = HEIGHT;   // 480：行宽方向
+  static const int PAGE_H = WIDTH;    // 648：翻页方向
 
   // mirrored: 屏物理旋转 180° 安装时置 true（对折书的右屏），
   // 流式发送时自动做 字节序反转 + 位反转

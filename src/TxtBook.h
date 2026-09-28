@@ -9,10 +9,11 @@
 //   open()       = Storage 挂载 + 打开文件 + 字库加载（CJK.begin）+ 串口 dump 头部
 //   renderPair() = 连续渲染左右两页（N / N+1），文件位置持续推进
 //
-// 排版按像素宽，三档字号（TxtBook::setTier，改默认见 TXT_SIZE_PX）：
-//   S(16) Font16 11px + Unifont 16px，行高 18，24 行/页
-//   M(24) Font24 17px + Unifont 1.5×，行高 28，15 行/页
-//   L(32) Font16 2× 放大 22px + Unifont 2×，行高 36，12 行/页
+// 排版按像素宽，三档字号（TxtBook::setTier，改默认见 TXT_SIZE_PX）。
+// 画布是竖版页 480×648（短边为横边，PAGE_ROTATE 旋转进 648×480 显存）：
+//   S(16) Font16 11px + Unifont 16px，行高 18，33 行/页
+//   M(24) Font24 17px + Unifont 1.5×，行高 28，21 行/页
+//   L(32) Font16 2× 放大 22px + Unifont 2×，行高 36，16 行/页
 //   拉丁按词断（词内不断），CJK 每字独立 token 两端可断 + 避头尾
 //   （行首禁则悬挂到行尾；放不下时把上一 token 推挤到下一行同行）；
 //   页尾半行回退文件位置（不丢不重），EOF 回卷从头再翻。
