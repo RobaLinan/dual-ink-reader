@@ -322,8 +322,20 @@ bool TxtBook::setFamily(const char* name) {
   return ok;
 }
 
+// 关句柄：切书与 SD 重挂载前调用。只动 m_file/m_ok —— m_page/m_pairStart
+// 保留，切走前 saveProgress() 还要读它们（进度不丢）
+void TxtBook::close() {
+  if (m_file) m_file.close();
+  m_ok = false;
+}
+
 bool TxtBook::open(const char* path) {
-  if (m_ok) return true;
+  if (m_ok) {              // 允许重开（EpubBook 每章换临时文本文件）
+    close();
+    m_hitEof = false;
+    m_page = 0;
+    m_pairStart = -1;
+  }
   if (!Storage::begin()) return false;
 
   setTier(TXT_SIZE_PX);            // 默认档（TxtBook.h 可改），按键阶段可运行期切换
@@ -342,17 +354,20 @@ bool TxtBook::open(const char* path) {
   Serial.printf("[SD] %s: %lu bytes\n", path, (unsigned long)m_file.size());
 
   const char* base = path[0] == '/' ? path + 1 : path;
-  snprintf(m_title, sizeof(m_title), "%s", base);
+  if (!m_titleOverridden)
+    snprintf(m_title, sizeof(m_title), "%s", base);
 
-  char dump[401];
-  int n = m_file.read((uint8_t*)dump, 400);
-  if (n > 0) {
-    dump[n] = '\0';
-    Serial.println("--- head 400B ---");
-    Serial.println(dump);
-    Serial.println("--- head end ---");
+  if (!m_quiet) {
+    char dump[401];
+    int n = m_file.read((uint8_t*)dump, 400);
+    if (n > 0) {
+      dump[n] = '\0';
+      Serial.println("--- head 400B ---");
+      Serial.println(dump);
+      Serial.println("--- head end ---");
+    }
+    m_file.seek(0);
   }
-  m_file.seek(0);
 
   CJK.begin("/fonts/unifont.bin");   // 缺了只警告，CJK 画方框，英文不受影响
   return true;
@@ -386,8 +401,37 @@ bool TxtBook::restorePair(long off, uint32_t page) {
   return true;
 }
 
+// 覆盖页眉标题（EPUB 用书名+章节号，不用临时文件名）
+void TxtBook::setTitle(const char* t) {
+  if (t) {
+    snprintf(m_title, sizeof(m_title), "%s", t);
+    m_titleOverridden = true;
+  } else {
+    m_title[0] = '\0';
+    m_titleOverridden = false;
+  }
+}
+
+// 空白页（页眉+分隔线，正文全白）：EPUB 章节在右页中间结束
+void TxtBook::renderBlank(uint8_t* fb, uint32_t pageNo) {
+  Paint_SelectImage(fb);
+  Paint_Clear(WHITE);
+  char hdr[48];
+  snprintf(hdr, sizeof(hdr), "%s   page %lu", m_title, (unsigned long)pageNo);
+  { int i = 0, x = TXT_X;
+    while (hdr[i]) {
+      int u; uint32_t cp = utf8At(hdr + i, (int)strlen(hdr) - i, &u);
+      if (cp < 0x80) { Paint_DrawChar(x, 8, (char)cp, &Font16, BLACK, WHITE); x += 11; }
+      else { CJK.drawGlyph(x, 8, cp, 16); x += 16; }
+      i += u;
+    } }
+  Paint_DrawLine(TXT_X, 26, EinkPanel::WIDTH - 1 - TXT_X, 26,
+                 BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
+}
+
 // 渲染一页（页眉+分隔线+正文）。文件位置持续推进 → 左右屏天然连续；
-// 页尾半行回退不丢字（s_lineStart = 当前行首 token 的文件位置），EOF 回卷
+// 页尾半行回退不丢字（s_lineStart = 当前行首 token 的文件位置）。
+// m_loop=false（EPUB）：EOF 后不再回卷，m_hitEof 置位返回
 bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
   if (!m_file) return false;
   Paint_SelectImage(fb);
@@ -405,6 +449,7 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
   Paint_DrawLine(TXT_X, 26, EinkPanel::WIDTH - 1 - TXT_X, 26,
                  BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
 
+  m_hitEof = false;
   s_lineLen = 0; s_px = 0; s_lines = 0; s_ntok = 0;
   s_pendingSpace = false;
   s_pageStart = m_file.position();
@@ -423,11 +468,13 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
     int cp = eof ? -1 : txtGetCp(m_file, raw, &rawLen);
     if (cp < 0) {
       eof = true;
+      m_hitEof = true;                       // EPUB 章末信号（loop 模式下同置位，无害）
       if (s_lines == 0 && s_lineLen == 0 && wlen == 0) {
-        if (rewound) break;             // 空文件兜底
+        if (!m_loop || rewound) break;       // 非循环：没有更多内容；空文件兜底
         rewound = true;
-        m_file.seek(0);                 // EOF 回卷：翻过末页后从头再来
+        m_file.seek(0);                      // EOF 回卷：TXT 翻过末页后从头再来
         eof = false;
+        m_hitEof = false;
         continue;
       }
     } else if (cp == '\n') {

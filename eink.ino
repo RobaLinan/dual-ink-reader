@@ -4,12 +4,15 @@
 //   EinkPanel  单屏驱动（UC8179，三档速度，DTM1 写真实上一帧）
 //   DualEink   双屏重叠刷新 present()：L 灌帧→DRF→趁 L busy 给 R 灌帧→DRF→等两屏
 //   Storage    SDMMC 1-bit @20MHz 挂载（正式引脚 38/39/40）
-//   TxtBook    TXT 打开 + 流式分页渲染（左 N / 右 N+1，按词断行）
+//   Book       统一书接口（TxtBook=TXT / EpubBook=EPUB，P4 起书库多书切换）
 //   PageStats  刷新耗时统计（min/avg/max + 超时，每 100 页汇总）
-//   DemoPage   兜底页码页（SD/TXT 不可用时）
+//   DemoPage   兜底页码页（SD/书不可用时）
 //
 // 节奏：每 5 次快刷插 1 次全刷（DESIGN §5.9 = Diptyx partialUpdatesRemaining=5）；
-// 降级链：右屏超时→单屏刷，SD/文件失败→页码 demo，都不挡测试。
+// 降级链：右屏超时→单屏刷，SD/书失败→页码 demo，都不挡测试。
+//
+// P4 书库/进度：开机扫 /books/*.txt + *.epub 成书库（串口 b 切下一本）；
+// 进度（路径+位置+页号+章号）存 NVS，每对页翻完/切书/深睡时写，开机按存档恢复。
 
 #include <ESP32epdx.h>
 #include <Preferences.h>
@@ -18,9 +21,12 @@
 #include "src/EinkPanel.h"
 #include "src/DualEink.h"
 #include "src/TxtBook.h"
+#include "src/EpubBook.h"
 #include "src/CjkFont.h"
 #include "src/PageStats.h"
 #include "src/DemoPage.h"
+#include "src/Storage.h"
+#include <SD_MMC.h>
 
 // === 引脚分配（DESIGN §1.1）===
 #define EINK_SCK   12
@@ -50,28 +56,112 @@ static const int SLEEP_HOLD_PINS[] = {EINK_SCK, EINK_MOSI,
                                       PIN_L_CS, PIN_L_DC, PIN_L_RST,
                                       PIN_R_CS, PIN_R_DC, PIN_R_RST};
 
-// 深睡跨醒保留（RTC 内存）：屏上那一对页的文件位置/页号
+// 深睡跨醒保留（RTC 内存）：屏上那一对页的位置/页号/章号（EPUB）
 RTC_DATA_ATTR long s_sleepFilePos = -1;
 RTC_DATA_ATTR uint32_t s_sleepPage = 0;
+RTC_DATA_ATTR int16_t s_sleepChapter = -1;   // ≥0 = EPUB 章号；-1 = TXT/无
 
 static const uint32_t FULL_EVERY = 5;        // 每 5 次快刷插 1 次全刷
 static const uint32_t PAGE_INTERVAL_MS = 5000;
 static const uint32_t FAST_TARGET_MS = 1800; // 验收线：整页 ≤1.8s
+static const uint32_t SAVE_EVERY_PAIRS = 10; // 进度落盘频率（对页数）
 
 EinkPanel left(PIN_L_CS, PIN_L_DC, PIN_L_RST, PIN_L_BUSY, EINK_SCK, EINK_MOSI);
 EinkPanel right(PIN_R_CS, PIN_R_DC, PIN_R_RST, PIN_R_BUSY,
                 EINK_SCK, EINK_MOSI, R_MIRRORED != 0);
 DualEink dual(left, right);
 TxtBook txt;
+EpubBook epub;
 PageStats stats;
-Preferences prefs;              // 字体/字号选择存 NVS（断电不丢）
+Preferences prefs;              // 字体/字号/当前书/进度存 NVS（断电不丢）
+
+// === P4 书库：/books 下的 *.txt / *.epub（根目录旧布局兜底）===
+struct LibEntry { char path[64]; bool epub; };   // 64 = "/books/" 前缀 + 长文件名不截断
+static LibEntry s_lib[16];
+static int s_nlib = 0;
+static int s_libIdx = -1;
+
+static bool hasExt(const char* name, const char* ext) {
+  size_t nl = strlen(name), el = strlen(ext);
+  if (nl <= el) return false;
+  const char* s = name + nl - el;
+  for (size_t i = 0; i < el; i++)
+    if (tolower((unsigned char)s[i]) != tolower((unsigned char)ext[i])) return false;
+  return true;
+}
+
+static void addLib(const char* path, bool epubFlag) {
+  if (s_nlib >= (int)(sizeof(s_lib) / sizeof(s_lib[0]))) return;
+  snprintf(s_lib[s_nlib].path, sizeof(s_lib[s_nlib].path), "%s", path);
+  s_lib[s_nlib].epub = epubFlag;
+  s_nlib++;
+}
+
+// 扫 /books（+ 根目录旧布局两个测试文件）。SD 不可用则空库
+static void scanLibrary() {
+  s_nlib = 0;
+  if (!Storage::begin()) return;
+  static const char kBooksDir[] = "/books";
+  File dir = SD_MMC.open(kBooksDir);
+  if (dir) {
+    for (File f = dir.openNextFile(); f && s_nlib < 16; f = dir.openNextFile()) {
+      if (f.isDirectory()) continue;
+      // 必须用 path()：core 2.0.17 的 name() 走 pathToFileName() 只回 basename，
+      // 存裸名会丢 /books/ 前缀 → open() 因"不以 / 开头"被 VFSImpl::open 拒掉
+      // （vfs_api.cpp "does not start with /"），于是每次开机都"列得出书却
+      // 打不开"、永远退 demo 页。path() 才是全路径
+      const char* n = f.path();
+      char built[64];
+      if (!n || n[0] != '/') {        // 兜底：极少数 core 不给全路径就自己拼
+        snprintf(built, sizeof(built), "%s/%s", kBooksDir, f.name() ? f.name() : "");
+        n = built;
+      }
+      if (hasExt(n, ".txt")) addLib(n, false);
+      else if (hasExt(n, ".epub")) addLib(n, true);
+    }
+    dir.close();
+  }
+  if (SD_MMC.open("/test_cn.txt")) addLib("/test_cn.txt", false);  // 旧布局兜底
+  if (SD_MMC.open("/test.txt")) addLib("/test.txt", false);
+  for (int i = 0; i < s_nlib; i++)
+    Serial.printf("[lib] %d: %s%s\n", i, s_lib[i].path, s_lib[i].epub ? " (epub)" : "");
+}
+
+Book* book = nullptr;      // 当前书（nullptr = 无书，demo 页）
+bool bookIsEpub = false;
 
 static uint8_t g_size = TXT_SIZE_PX;   // 当前字号档（16/24/32）
 static int g_fam = 0;                  // 当前家族（0=classic）
 
 static void printFontState() {
-  Serial.printf("[font] family=%s size=%u  (serial: f=next font, s=next size)\n",
-                CJK.familyName(g_fam), g_size);
+  Serial.printf("[font] family=%s size=%u book=%s (serial: f=font s=size b=next book h=status)\n",
+                CJK.familyName(g_fam), g_size,
+                s_libIdx >= 0 ? s_lib[s_libIdx].path : "-");
+}
+
+// 进度落盘：路径 + 对页位置/页号（+EPUB 章号）。调用点：翻页周期、切书、深睡
+static void saveProgress() {
+  if (!book || s_libIdx < 0) return;
+  prefs.putString("book", s_lib[s_libIdx].path);
+  prefs.putLong("pos", book->pairFilePos());
+  prefs.putUInt("page", book->pairPageNo());
+  prefs.putShort("ch", bookIsEpub ? (int16_t)epub.pairChapter() : (int16_t)-1);
+}
+
+// 打开书库第 idx 本。true = 打开成功（旧进度由调用方按需恢复）
+static bool openBook(int idx) {
+  if (idx < 0 || idx >= s_nlib) return false;
+  if (book) book->close();      // 旧书句柄先关（进度已存盘；SD 重挂前必须无旧句柄）
+  bookIsEpub = s_lib[idx].epub;
+  book = bookIsEpub ? (Book*)&epub : (Book*)&txt;
+  bool ok = book->open(s_lib[idx].path);
+  if (!ok) { book = nullptr; return false; }
+  s_libIdx = idx;
+  book->setTier(g_size);
+  String fam = prefs.getString("font", "classic");
+  book->setFamily(fam.c_str());
+  g_fam = CJK.currentFamily();
+  return true;
 }
 
 // 双缓冲 × 两屏：shown = 屏上当前帧，draw = 正在绘制的下一帧
@@ -80,9 +170,10 @@ uint8_t* fbDrawL = nullptr;
 uint8_t* fbShownR = nullptr;
 uint8_t* fbDrawR = nullptr;
 bool dualOk = false;   // 两屏都就绪；false = 单屏退化
-bool txtOk = false;    // TXT 可用；false = 退页码 demo
+bool bookOk = false;   // 书可用；false = 退页码 demo
 uint32_t pageCount = 0;    // 刷新次数（管节奏 + 统计）
-uint32_t demoPage = 0;     // demo 页号（TXT 不可用时用）
+uint32_t demoPage = 0;     // demo 页号（书不可用时用）
+int tmp1 = 0;
 
 static uint8_t* allocFrame() {
   uint8_t* p = (uint8_t*)ps_malloc(EinkPanel::FULL_BYTES);
@@ -90,13 +181,13 @@ static uint8_t* allocFrame() {
   return p;
 }
 
-// 本次刷新要显示的左右两页内容：优先 TXT，不可用则退回页码 demo
+// 本次刷新要显示的左右两页内容：优先书，不可用则退回页码 demo
 static void preparePages(bool fullMode) {
-  if (txtOk && !txt.renderPair(fbDrawL, fbDrawR)) {
-    Serial.println("WARN: txt render failed - fallback to demo pages");
-    txtOk = false;
+  if (bookOk && book && !book->renderPair(fbDrawL, fbDrawR)) {
+    Serial.println("WARN: book render failed - fallback to demo pages");
+    bookOk = false;
   }
-  if (!txtOk) {
+  if (!bookOk) {
     drawDemoPage(fbDrawL, demoPage, "LEFT  (demo)", fullMode);
     drawDemoPage(fbDrawR, demoPage + 1, "RIGHT (demo)", fullMode);
     demoPage += 2;
@@ -186,20 +277,28 @@ void setup() {
     Serial.println("WARN: right panel begin() timeout - single screen mode");
   }
 
-  // 中英混排测试文件优先，缺了退回纯英文（P3 回归）；根目录旧布局兜底
-  txtOk = txt.open("/books/test_cn.txt") || txt.open("/books/test.txt") ||
-          txt.open("/test_cn.txt") || txt.open("/test.txt");
-  if (!txtOk) Serial.println("WARN: no txt on SD - demo pages only");
+  // === P4 书库：扫描 → 按 NVS 存档（无则 test_cn → test → 第一本）===
+  scanLibrary();
+  g_size = prefs.getUChar("size", TXT_SIZE_PX);
+  int startIdx = -1;
+  String lastBook = prefs.getString("book", "");
+  if (lastBook.length())
+    for (int i = 0; i < s_nlib; i++)
+      if (lastBook.equals(s_lib[i].path)) { startIdx = i; break; }
+  if (startIdx < 0)
+    for (int i = 0; i < s_nlib; i++)
+      if (strstr(s_lib[i].path, "test_cn.txt")) { startIdx = i; break; }
+  if (startIdx < 0)
+    for (int i = 0; i < s_nlib; i++)
+      if (strstr(s_lib[i].path, "test.txt")) { startIdx = i; break; }
+  if (startIdx < 0 && s_nlib > 0) startIdx = 0;
 
-  // 恢复用户上次的字体/字号（NVS），首次默认 classic + TXT_SIZE_PX
-  if (txtOk) {
-    g_size = prefs.getUChar("size", TXT_SIZE_PX);
-    String fam = prefs.getString("font", "classic");
-    txt.setTier(g_size);
-    txt.setFamily(fam.c_str());
-    g_fam = CJK.currentFamily();
-    printFontState();
-  }
+  // 首选书打不开（损坏/被删/存档路径失效）→ 顺位试完书库其余，全失败才退 demo
+  bookOk = openBook(startIdx);
+  for (int i = 1; !bookOk && i < s_nlib; i++)
+    bookOk = openBook((startIdx + i) % s_nlib);
+  if (!bookOk) Serial.println("WARN: no book on SD - demo pages only");
+  else printFontState();
 
   // 第 0/1 页：全刷（shown 还是白的）→ 之后 shown 永远 = 屏上真实内容。
   // EXT1 深睡唤醒例外：屏上图像没丢（VCI 常供），把存档对页重画进 fbDraw 再
@@ -208,7 +307,15 @@ void setup() {
   bool resumed = false;
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
     Serial.println("[wake] EXT1 (lid opened) - resuming book");
-    if (txtOk && s_sleepFilePos >= 0 && txt.restorePair(s_sleepFilePos, s_sleepPage)) {
+    bool restored = false;
+    if (bookOk && s_sleepFilePos >= 0) {
+      if (bookIsEpub)
+        restored = s_sleepChapter >= 0 &&
+                   epub.restorePair((uint16_t)s_sleepChapter, s_sleepFilePos, s_sleepPage);
+      else
+        restored = txt.restorePair(s_sleepFilePos, s_sleepPage);
+    }
+    if (restored) {
       preparePages(true);
       memcpy(fbShownL, fbDrawL, EinkPanel::FULL_BYTES);
       memcpy(fbShownR, fbDrawR, EinkPanel::FULL_BYTES);
@@ -216,6 +323,20 @@ void setup() {
       Serial.printf("[wake] page %lu re-rendered into RAM, panel untouched\n",
                     (unsigned long)s_sleepPage);
     }
+  }
+  if (!resumed && bookOk) {
+    // 冷启动：按 NVS 进度恢复（上次读到哪从哪开始；无存档 = 第 0 页）
+    long pos = prefs.getLong("pos", -1);
+    uint32_t pg = prefs.getUInt("page", 0);
+    int16_t ch = prefs.getShort("ch", -1);
+    bool restored = false;
+    if (pos >= 0) {
+      if (bookIsEpub)
+        restored = ch >= 0 && epub.restorePair((uint16_t)ch, pos, pg);
+      else
+        restored = txt.restorePair(pos, pg);
+    }
+    if (!restored) book->restartPair();   // 无有效存档：从第 0 对页开始
   }
   if (!resumed) runRefresh(true);
 }
@@ -230,10 +351,13 @@ static bool hallClosing() {
 
 // 合盖 → 存对页位置 → SPI 引脚 hold → EXT1(开盖) 深睡。不返回
 static void enterDeepSleep() {
-  s_sleepFilePos = txtOk ? txt.pairFilePos() : -1;
-  s_sleepPage    = txtOk ? txt.pairPageNo() : 0;
-  Serial.printf("[%lu ms] lid closed -> deep sleep (pos=%ld page=%lu)\n",
-                (unsigned long)millis(), s_sleepFilePos, (unsigned long)s_sleepPage);
+  saveProgress();
+  s_sleepFilePos = bookOk ? book->pairFilePos() : -1;
+  s_sleepPage    = bookOk ? book->pairPageNo() : 0;
+  s_sleepChapter = (bookOk && bookIsEpub) ? (int16_t)epub.pairChapter() : (int16_t)-1;
+  Serial.printf("[%lu ms] lid closed -> deep sleep (pos=%ld page=%lu ch=%d)\n",
+                (unsigned long)millis(), s_sleepFilePos, (unsigned long)s_sleepPage,
+                (int)s_sleepChapter);
   if (Serial) Serial.flush();
 
   gpio_deep_sleep_hold_en();
@@ -252,28 +376,47 @@ static void enterDeepSleep() {
 
 // 字体/字号切换后：同一对页按新字体立即重排（Kindle 式切换即预览）
 static void previewFontChange() {
-  if (txtOk && txt.restartPair()) runRefresh(false);
+  if (bookOk && book->restartPair()) runRefresh(false);
 }
 
-// 串口命令：f = 切字体家族（SD 包自动发现），s = 切字号 16/24/32，h = 状态
-// （P6 4 键落地后绑同一套 setFamily/setTier）
+// 切下一本书：关当前 → 开下一本 → 从第 0 页起（进度已随切书落盘）
+static void nextBook() {
+  if (s_nlib <= 1) return;
+  saveProgress();
+  int idx = (s_libIdx + 1) % s_nlib;
+  if (!openBook(idx)) {
+    Serial.println("WARN: next book open failed - keeping demo");
+    bookOk = false;
+    return;
+  }
+  bookOk = true;
+  prefs.remove("pos"); prefs.remove("page"); prefs.remove("ch");  // 新书从第 0 页起
+  saveProgress();
+  printFontState();
+  runRefresh(true);
+}
+
+// 串口命令：f = 切字体家族（SD 包自动发现），s = 切字号 16/24/32，
+// b = 切下一本书，h = 状态（P6 4 键落地后绑同一套接口）
 static void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == 'f' && CJK.familyCount() > 1) {
       g_fam = (g_fam + 1) % CJK.familyCount();
-      txt.setFamily(CJK.familyName(g_fam));
+      if (book) book->setFamily(CJK.familyName(g_fam));
       g_fam = CJK.currentFamily();              // 包装载失败会自动回 classic
       prefs.putString("font", CJK.familyName(g_fam));
       printFontState();
       previewFontChange();
     } else if (c == 's') {
       g_size = (g_size == 16) ? 24 : (g_size == 24 ? 32 : 16);
-      txt.setTier(g_size);
+      if (book) book->setTier(g_size);
       g_fam = CJK.currentFamily();
       prefs.putUChar("size", g_size);
       printFontState();
       previewFontChange();
+    } else if (c == 'b') {
+      nextBook();
     } else if (c == 'h') {
       printFontState();
     }
@@ -291,5 +434,6 @@ void loop() {
 
   pageCount++;
   runRefresh(pageCount % (FULL_EVERY + 1) == 0);
+  if (pageCount % SAVE_EVERY_PAIRS == 0) saveProgress();   // 周期进度落盘
   if (pageCount % 100 == 0) stats.printSummary(pageCount, FAST_TARGET_MS);
 }

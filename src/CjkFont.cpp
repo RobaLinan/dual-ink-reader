@@ -132,6 +132,11 @@ void CjkFont::unloadPack() {
 }
 
 bool CjkFont::setFamily(int idx, uint8_t sizePx) {
+  // 同家族同档且已装载 → 直接复用（EPUB 每章切换都调 setFamily，
+  // 否则 kai 这类几 MB 的包会从 SD 反复整载，刷屏节奏被拖垮）
+  if (idx > 0 && idx == m_fam && sizePx == m_packSizePx &&
+      (m_pack || m_packFile))
+    return true;
   unloadPack();
   if (idx <= 0) return true;                       // classic
   if (idx >= m_nfam) idx = 0;

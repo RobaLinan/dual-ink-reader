@@ -93,7 +93,7 @@ shown 永远 = 屏上真实内容）。
 | P1 ✅ | EinkPanel 类 + 翻页 demo | 全刷/快刷实测、20 次快刷残影可接受 |
 | P2 ✅ | 第二块屏 + `DualEink::present()` 重叠刷新（对照 Diptyx 固件） | 整页 ≤1.8s ✅（实测 1306ms）、100 次无花屏无重启 ✅、双屏电流待补测（无表；100 次无重启=间接通过） |
 | P3 ✅ | SDMMC + UTF-8 + 字体 + 断行 + 分页 + 霍尔深睡（2026-09-24 收官；4 键已挪 P6） | TXT 中英混排；合盖深睡开盖 2s 恢复 —— 全过 |
-| P4 | miniz + tinyxml2（锁版本）+ 书库 + 进度 | EPUB 读完一章不崩不 OOM（>280KB 章节流式） |
+| P4 ✅(代码) | miniz + tinyxml2（锁版本，src/VENDOR.md）+ 书库 + 进度 | EPUB 读完一章不崩不 OOM（>280KB 章节流式）——主机端管线验证过；屏上实测待烧录 |
 | P5 | 跨页语义：左 N / 右 N+1 | 翻 50 页内容连续 |
 | P6 | 3D 打印底板 + 铰链 + 10 芯排线 + 按键小板 + **4 键逻辑**（自 P3 挪入：依赖按键小板/PCB） | 连续翻页无复位；**验证电池包深睡不自动关机** |
 | P7 | 打磨：电量/封面页/VCOM 逐屏标定/温度补偿 | 待机 ≥1 月 |
@@ -120,7 +120,34 @@ shown 永远 = 屏上真实内容）。
 > - **交接**：4 键过渡期用串口 `f`/`s`（`setTier`/`setFamily` 接口已备好），
 >   4 键 / 电池包不自动关机验证在 P6
 >
-> 下一步 → **P4**：miniz + tinyxml2 EPUB 流式解析。
+> 下一步 → **P5**：跨页语义。
+>
+> **P4（2026-09-24，编译过 + 主机端管线验证过，屏上实测待烧录）**：
+> - **vendored 锁版本**：miniz 3.0.2（zip 解压，原样）+ tinyxml2 10.0.0
+>   （打 1 类补丁：定义 `TIXML2_PSRAM_POOL` 时 MemPoolT 4KB 池块 +
+>   `_charBuffer` 文档缓冲走 ps_malloc，失败回退 malloc——>280KB 章节的 DOM
+>   不挤 250KB DRAM；补丁位置/升级注意见 src/VENDOR.md）
+> - **一章一转换**（`EpubBook` 组合 `TxtBook`，排版引擎零重写）：
+>   miniz 流式解压章 XHTML → SD 临时文件（坑 6 定案路径）→ 整章读进 PSRAM
+>   （444KB 实测装得下）→ tinyxml2 解析 → DOM 抽正文（跳过 style/script/head，
+>   块级补 \n，空白折叠，连续空行封顶 2）→ 2KB 缓冲写 SD 临时文本 → TxtBook
+>   当 TXT 翻（三档字号/四家族/避头尾全继承）。解析失败自动降级"剥标签"兜底
+> - **章末推进**：TxtBook 加 setLoop(false)/hitEof()；右页中道结束画空白页，
+>   下一对页自动进下一章，坏章自动跳过（guard 防死循环），全书读完回卷
+> - **实体预替换**：tinyxml2 只认 5 内置实体、其余原样透传 → 解析前压缩式
+>   单遍替换 &nbsp; &ldquo; &mdash; &hellip; 等（UTF-8 BOM 顺手剥掉）
+> - **书库 + 进度**：开机扫 /books/*.txt + *.epub（根目录旧布局兜底），串口
+>   `b` 切下一本；进度（路径+章号+章内偏移+页号）存 NVS，每 10 对页/切书/
+>   深睡时落盘，冷启动按存档恢复；深睡 RTC 增加章号，开盖回页对 EPUB 同样零闪烁
+> - **顺手修**：CjkFont::setFamily 同家族同档短路（否则 EPUB 每章切换会把
+>   kai 几 MB 字库包从 SD 反复整载）；TxtBook::open 允许重开（关旧文件）
+> - **测试书**：`tools/mk_test_epub.py` 生成 assets/books/test.epub（3 章，
+>   第二章 444KB >280KB 验收线；混入中文/英文/实体/弯引号/br/嵌套/脚本）；
+>   主机端用同款代码 + vendored tinyxml2 验证：三章全解析成功、实体全替换、
+>   script/style 零泄漏、无三连空行
+> - **验收清单**（屏上，烧录后过）：①开test.epub 翻完 444KB 章不崩不 OOM
+>   （串口盯 `[epub] chapter ... psram free=` 与 `[mem]`）②章间翻页连续无重页
+>   ③合盖开盖回页（含章号）④`b` 切书 ⑤字体/字号切换即预览对 EPUB 生效
 
 ## 5. 已知的坑（详见方案文档）
 1. 电池包自动关机 → 深睡报废（选型硬指标）
@@ -175,6 +202,12 @@ shown 永远 = 屏上真实内容）。
     CMD/D0 上拉 + setPins，end() 会拆引脚配置），挂载成功后加**根目录探针**
     （open("/") 失败视为半挂载拆了重来——挂载过了但首开文件失败的症状同源，
     TxtBook/CjkFont 开文件另带 100ms 退避重试 ×3）；挂载失败不缓存只是兜底，别依赖它
+16. miniz `extract_to_callback`/`extract_to_mem*` 把 `tinfl_decompressor`（≈8.2KB）
+    放**栈**上 → `loopTask` 默认 8KB 栈进函数即溢出（2026-09-24：开机串口 `b` 切到
+    EPUB 直接 reboot，栈顶 `|<-CORRUPTED`）→ `EpubZip` 改走迭代式
+    `extract_iter_new/read/free`（解压器状态在堆分配的 iter_state 里），零补丁，
+    详见 `src/VENDOR.md`。**排查口诀**：EPUB 独有路径崩 = 先查 miniz/tinyxml2 的
+    栈上大数组，TXT 路径不经过它们所以"之前一直没事"
 
 ## 6. 本地工具
 - 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default /home/roba/Arduino/eink`
@@ -190,9 +223,51 @@ shown 永远 = 屏上真实内容）。
 - **SD 卡目录布局**（与 `assets/` 一一对应，`cp -r assets/. <SD卡>/` 即部署完）：
   - `/fonts/`：`unifont.bin`（2MB，classic 模式 + 缺字回退，必需）+ 可选
     `font-<名字>-<16|24|32>.bin`（字体家族，缺某档自动回 classic）
-  - `/books/`：电子书 `*.txt`；`eink.ino` 依次试 `/books/test_cn.txt` →
-    `/books/test.txt` → 根目录同名文件（旧布局兜底）
+  - `/books/`：电子书 `*.txt` **和 `*.epub`**（P4 起书库扫描两类，串口 `b` 切换）
   → 缺 `unifont.bin` 时汉字全画 16×16 空心框
 - 霍尔深睡台架测试：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default /home/roba/Arduino/eink/hall_sleep_test`
   （合盖 300ms 深睡 / EXT1 开盖唤醒 / RGB 48 可视判定；极性反了改 `HALL_CLOSED_LEVEL`）
 - 资料：`~/Downloads/Gdey0583T81/`（屏规格书 + UC8179 数据手册 + 官方 demo 压缩包）
+
+## 7. 双核并行备忘（2026-09-24 讨论 · 未采用，P4 按数据再评估）
+
+**问题**：要不要 core0 读 SD、core1 渲染？
+
+**结论：现阶段不值得** —— 瓶颈是电子纸物理刷新，不是计算。重叠掉的渲染只占周期 4–5%：
+
+| 阶段 | 实测（fast 页周期） | 占比 |
+|---|---|---|
+| SD 读 + 解码 + 排版渲染 ×2 页 | 50–73ms（25–37ms/页） | ~4–5% |
+| SPI 搬帧（27.6KB×2 @10MHz） | ~16ms | ~1% |
+| 物理刷新 BUSY 等待 | **1311ms**（全刷 3826ms） | ~94% |
+
+SD 读本身每页仅 1–2ms（1-bit@20MHz ≈ 2.5MB/s，每页几 KB）。
+
+**讨论里站得住的两个出处**（不是速度，是这两点）：
+1. 全刷 3.8s 期间 `present()` 阻塞 → 串口 `f`/`s`、霍尔轮询全停 = 固件"假死感"
+2. P4 EPUB 章节头一次解析（miniz 解 280KB + XML 扫描）可能几百 ms，
+   落在章节首页 = 可感知卡顿
+
+**若将来并行，切口别切在"SD vs 渲染"**：`TxtBook` 是紧耦合流式管线
+（读 chunk → UTF-8 解码 → 断词断行 → 直接画 fb），中间架生产者-消费者队列
+复杂度高、收益 ≈0（读只占 1–2ms）。正确切口 = **整页预取**：后台任务独占
+`txt` + SD + Paint，把下一对页渲进备用缓冲（三缓冲轮换 6 个 fb ≈ 166KB，
+PSRAM 无压力），前台 loop 只 present + 换挡，换挡点一道栅栏。单写者模型天然无锁。
+
+**本代码库会咬人的点**：
+- `GUI_Paint` 是**全局单例**（`Paint_NewImage` 一个全局结构）：渲染必须始终
+  单核单写者；想左右页各一核并行画 = 必花屏（P1 花屏同族问题）
+- `TxtBook` 游标状态（`m_file/m_page/m_pairStart`）：`f`/`s` 的
+  `restartPair()+renderPair()` 必须改成给渲染任务发消息，主线程不许直接碰
+- 深睡协调：SPI 在飞绝不能睡（图像断半截）；霍尔触发要等 present 完成 +
+  渲染任务静默，才能 `gpio_hold` → 单线程纪律升级成双任务握手
+- 可行性无问题：`loopTask` 默认就在 core1，WiFi/BT 关着，core0 基本闲着
+
+**更便宜的中间方案**（同样收益、零竞态）：`present()` 拆成"发帧 → 等 BUSY"
+两段，在 BUSY 等待的 1300ms 里**单线程**渲染下一对页 —— 串口/霍尔在刷新间隙
+即响应，省下的毫秒数与双核方案几乎相同。
+
+**决策路径**：
+1. 现在：不动（单线程 1.36s/页，达标 ≤1.8s）
+2. P4 实测单页渲染 >100–200ms 或章节首页卡顿明显 → 先上"BUSY 期间渲染下一页"
+3. 仍不够 → 再上 core0 预取任务（上面的单写者设计），收益门槛到了再付复杂度

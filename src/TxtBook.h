@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <FS.h>
+#include "Book.h"
 
 // P3：SD 卡纯文本阅读（中英混排，DESIGN §5.5）
 //   open()       = Storage 挂载 + 打开文件 + 字库加载（CJK.begin）+ 串口 dump 头部
@@ -19,11 +20,12 @@
 #ifndef TXT_SIZE_PX
 #define TXT_SIZE_PX 16     // 默认字号档（16/24/32）：改这里再编译即可换档
 #endif
-class TxtBook {
+class TxtBook : public Book {
 public:
   // 挂载 SD 并打开 path。false = 卡/文件问题（不 fatal，调用方退 demo 页）
   bool open(const char* path);
   bool isOpen() const { return m_ok; }
+  void close() override;               // 关文件句柄（切书/SD 重挂载前）；进度状态保留
 
   // 切字号档（16/24/32），只影响之后渲染的页；非法值回退 16。
   // 家族包模式下会按新档位重载包（该档缺文件 → 回 classic）
@@ -38,23 +40,47 @@ public:
   bool restartPair();
 
   // 深睡存档/恢复（RTC 内存跨睡保留）：屏上对页的文件位置与页号
-  long pairFilePos() const { return m_pairStart; }
-  uint32_t pairPageNo() const { return m_pairStartPage; }
+  long pairFilePos() const override { return m_pairStart; }
+  uint32_t pairPageNo() const override { return m_pairStartPage; }
+  // 当前章内文件实时位置（EpubBook 直接调 renderPage 步进，不走 renderPair，
+  // 需要用这个取"下一对页起点"）
+  long curFilePos() const { return m_file ? (long)m_file.position() : -1; }
   bool restorePair(long off, uint32_t page);  // seek 回对页起点，调用方负责重画
 
   // 渲染接下来的左右两页到 fbL/fbR。
   // false = 渲染不出内容（此后 isOpen() 变 false）
   bool renderPair(uint8_t* fbL, uint8_t* fbR);
 
-private:
+  // —— P4 EPUB 复用接口（EpubBook 组合 TxtBook 排版引擎）——
+  // 渲染单页（renderPair 的内部步进，EPUB 章末要在左右页之间插空白页）
   bool renderPage(uint8_t* fb, uint32_t pageNo);
+
+  // 空白页（只有页眉+分隔线）：EPUB 章节在右页中间结束时用
+  void renderBlank(uint8_t* fb, uint32_t pageNo);
+
+  // 循环开关：true（默认）= TXT 翻完回卷从头；false = EPUB 章末停在 EOF，
+  // hitEof() 置位，不自动回卷（由 EpubBook 切下一章）
+  void setLoop(bool loop) { m_loop = loop; }
+  bool hitEof() const { return m_hitEof; }
+
+  // 覆盖页眉标题（EPUB 用书标题替代临时文件名）；nullptr 恢复用文件名
+  void setTitle(const char* t);
+
+  // 关掉串口头部 dump（EPUB 章节切换太频繁，日志会刷屏）
+  void setQuiet(bool q) { m_quiet = q; }
+
+private:
 
   File m_file;
   bool m_ok = false;
+  bool m_loop = true;    // false = EPUB 模式：EOF 停住不回头（setLoop 切换）
+  bool m_hitEof = false; // 上一次渲染触碰过文件尾（EPUB 章末推进用）
+  bool m_quiet = false;  // true = open() 不 dump 头部 400B
   uint32_t m_page = 0;   // 下一个要渲染的页号
   long m_pairStart = -1;      // 最近一次 renderPair 的文件起点（restartPair 用）
   uint32_t m_pairStartPage = 0;
-  char m_title[32];      // 页眉用（取自文件名）
+  bool m_titleOverridden = false;
+  char m_title[32];      // 页眉用（取自文件名，可被 setTitle 覆盖）
 };
 
 #endif  // TXT_BOOK_H

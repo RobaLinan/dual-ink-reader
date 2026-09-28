@@ -31,6 +31,10 @@ public:
   bool begin(const char* path = "/fonts/unifont.bin");
   bool ok() const { return m_ok; }
 
+  // 是否有句柄正开着（unifont/家族包没整载进 PSRAM 时走 SD 流式模式）。
+  // SD 重挂载前必须查：流式句柄跨重挂失效，且 begin() 有 m_ok 短路不会重开
+  bool sdOpen() const { return (bool)m_file || (bool)m_packFile; }
+
   // —— 家族管理 ——
   int  familyCount() const { return m_nfam; }          // 0 恒为 classic
   const char* familyName(int i) const;                 // 越界 → "classic"

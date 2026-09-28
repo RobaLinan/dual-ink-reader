@@ -12,6 +12,12 @@ class Storage {
 public:
   static bool begin();     // setPins + 挂载（失败指数退避重试 5 次，防冷上电 0x107）
   static bool mounted();
+
+  // SD 写失败自救：end() + begin() 重挂（卡走 CMD0 重新初始化，驱动状态全清）。
+  // 调用纪律：**先把所有 SD 文件句柄关掉**（Book::close / EpubZip::close / …），
+  // 重挂后旧句柄全部失效。挂载失败不缓存，返回 false 表示这轮没救（调用方
+  // 自己决定要不要再试——每次失败可能连环 5s 写超时，别无脑重来）
+  static bool recover();
 };
 
 #endif  // STORAGE_H

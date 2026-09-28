@@ -52,3 +52,14 @@ bool Storage::begin() {
 }
 
 bool Storage::mounted() { return s_mounted; }
+
+bool Storage::recover() {
+  Serial.println("[SD] recover: end + remount (card re-init via CMD0)");
+  uint32_t t0 = millis();
+  SD_MMC.end();            // 只拆挂载，不动引脚；begin() 里会重拉上拉 + setPins
+  s_mounted = false;
+  bool ok = begin();
+  Serial.printf("[SD] recover: %s (%lu ms)\n", ok ? "OK" : "FAILED",
+                (unsigned long)(millis() - t0));
+  return ok;
+}
