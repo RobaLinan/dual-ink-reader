@@ -55,6 +55,9 @@ private:
   void handleUploadForm();
   void handleUploadResult();
   void uploadChunk();
+  bool upWrite(const uint8_t* p, size_t n);   // 512B 对齐分块写，false=写不动
+  bool upFlush();                             // 写掉尾部不足 512B 的余量
+  void upAbort(const char* msg);              // 关句柄→重挂→删半截文件（msg 可为空）
   void handleUpdateForm();
   void handleUpdateResult();
   void updateChunk();
@@ -79,7 +82,9 @@ private:
   const char* m_upMsg = nullptr;   // 失败原因（全部指向静态字面量）
   bool m_upActive = false;
   bool m_upDone = false;
-  size_t m_upBytes = 0;
+  size_t m_upBytes = 0;       // 已落盘字节数（END 时和 u.totalSize 对账）
+  uint8_t m_upBuf[512] = {0}; // 512B 累加器：只整扇区写 → 每次 f_write 都是单块 CMD24
+  size_t m_upFill = 0;
   bool m_updBlocked = false;       // OTA 关时收到 /update 上传 → 拒绝且不碰 Update
 };
 

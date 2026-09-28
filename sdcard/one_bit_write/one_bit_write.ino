@@ -309,6 +309,7 @@ struct PassRes {
   bool saw0x109 = false;       // 本轮是否出现过 CRC 错（坑18 指纹）
   bool pacedRan = false;       // F 节流写档是否跑过
   bool pacedOk = false;
+  bool smallOk = false;        // E 512B 单块写过了 2MB（而 4KB 多块挂）
   float writeMBs = 0;
   float bigMBs = 0;            // G 32KB 大块吞吐
 };
@@ -370,6 +371,7 @@ static void runPass(int idx) {
       if (!p.failStage) { p.failStage = "E 判别"; p.failAt = r.done; p.failErr = g_drvErr; }
       p.dead = !recover(freq);
     } else {
+      p.smallOk = true;   // 多块挂、单块过 = 分块是决定性变量（见结论区）
       p.maxWriteOk = 2 * 1024 * 1024;
     }
   }
@@ -426,6 +428,8 @@ static void verdict() {
                     p.failStage ? p.failStage : "?", p.failAt,
                     p.failErr, errName(p.failErr), p.dead ? "，恢复失败=锁死" : "",
                     p.saw0x109 ? "，本轮出现过 0x109 CRC" : "");
+      if (p.smallOk) Serial.println("    ↳ 但 512B 单块写完整过了 2MB + 读回校验 = 分块是决定性变量");
+      if (p.dead) Serial.println("    ↳ 锁死时 f.close 没提交 size → 文件只剩 0 字节壳，写入的数据真丢");
     } else {
       if (p.writeMBs) Serial.printf(" ｜ %.2f MB/s", p.writeMBs);
       if (p.bigMBs) Serial.printf("（32KB 大块 %.2f MB/s）", p.bigMBs);
@@ -441,6 +445,10 @@ static void verdict() {
     Serial.println("  20MHz 全过 = 写路径硬件 OK，可回填 DESIGN §5.7 待补项。");
   } else if (b.mounted && !b.writeFail) {
     Serial.println("  仅 10MHz 过 = 信号边际 → 查 WIRING §4：卡座 VDD 10µF+100nF 就近去耦、CMD/D0 实体 47k 上拉。");
+  } else if (a.smallOk || b.smallOk) {
+    Serial.println("  4KB 多块写（CMD25）挂、512B 单块写（CMD24）过 2MB = 分块是决定性变量。");
+    Serial.println("   → 软件缓解：SD 写入一律 ≤512B 分块（实测 0.25MB/s 不损失）+ 每块查返回值。");
+    Serial.println("   → 根因未变：卡写能力/供电边际（换卡排除 + 卡座 VDD 去耦，见 WIRING §4）。");
   } else if (a.saw0x109 || b.saw0x109) {
     Serial.println("  出现过 0x109 CRC = DESIGN 坑 18 指纹 → 换卡排除 + 卡座去耦，断电重插再测。");
   } else if (a.pacedRan && a.pacedOk) {
@@ -452,8 +460,11 @@ static void verdict() {
   }
 }
 
+static uint16_t s_runNo = 0;   // 本次开机第几次运行 —— 判"只有上电首轮能过"要靠它
+
 static void runAll() {
-  Serial.printf("\n\n############ 测试开始 %lu ms ############\n", (unsigned long)millis());
+  Serial.printf("\n\n############ 测试开始 %lu ms（本次开机第 %u 次运行） ############\n",
+                (unsigned long)millis(), (unsigned)(++s_runNo));
   runPass(0);
   if (g_pass[0].writeFail) runPass(1);   // 20MHz 有挂才降频复测
   else g_pass[1] = PassRes();

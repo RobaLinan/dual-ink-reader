@@ -121,6 +121,7 @@ void NetSvc::beforeSleep() {
     m_upFile.close();
     SD_MMC.remove(m_upPath);
     m_upActive = false;
+    m_upFill = 0;
   }
   if (m_otaUp) { ArduinoOTA.end(); m_otaUp = false; }
   if (m_serverUp) { s_srv.stop(); m_serverUp = false; }
@@ -328,6 +329,54 @@ void NetSvc::handleUploadForm() {
   s_srv.send(200, "text/html; charset=utf-8", page);
 }
 
+// 512B 对齐分块写：让每次 f_write 恰好一个扇区 → SD 驱动走单块写（CMD24）。
+// DESIGN 坑 18 三轮实测（同上电 / 同接线 / 同卡，sdcard/one_bit_write v3）：
+//   4KB 多块写(CMD25) 3/3 必挂（0~120KB 间任意一点），512B 单块写 2/3 过 2MB + 读回校验，
+//   两者吞吐同为 0.25MB/s → 分块改小没有速度代价，只有稳定性的差别。
+// HTTP 分块不是扇区对齐的，所以先在 m_upBuf 里攒够 512B 再整块落盘，
+// 文件偏移因此永远是 512 的整倍数，不会触发 FatFS 的读-改-写半个扇区。
+// 返回 false = 卡已经写不动（大概率锁死），调用方必须立刻收摊、别再碰 SD。
+bool NetSvc::upWrite(const uint8_t* p, size_t n) {
+  size_t done = 0;
+  while (done < n) {
+    size_t take = 512 - m_upFill;
+    if (take > n - done) take = n - done;
+    memcpy(m_upBuf + m_upFill, p + done, take);
+    m_upFill += take;
+    done += take;
+    if (m_upFill < 512) continue;
+    if (m_upFile.write(m_upBuf, 512) != 512) return false;
+    m_upFill = 0;
+    m_upBytes += 512;
+  }
+  return true;
+}
+
+bool NetSvc::upFlush() {
+  if (!m_upFill) return true;
+  if (m_upFile.write(m_upBuf, m_upFill) != m_upFill) return false;
+  m_upBytes += m_upFill;
+  m_upFill = 0;
+  return true;
+}
+
+// 写失败/中断后的收摊。顺序要紧：先 close 再 recover —— Storage::recover() 会
+// end()，句柄开着就 end 是未定义行为；重挂之后删半截文件才有机会删得掉。
+// recover 失败就不删了（再 remove 又是一轮 5s 超时），留个 0 字节壳下次覆盖即可。
+void NetSvc::upAbort(const char* msg) {
+  if (msg) m_upMsg = msg;
+  Serial.printf("[net] upload abort: %s (%s)\n", m_upPath,
+                m_upMsg ? m_upMsg : "中断");
+  m_upFile.close();                 // 卡死时这一步就会卡满一个 5s 命令超时，认了
+  bool ok = Storage::recover();
+  if (ok && m_upPath[0]) SD_MMC.remove(m_upPath);
+  if (!ok && m_upPath[0])
+    m_upMsg = "SD 卡锁死：文件已损坏，请断电重插卡后重传";
+  m_upActive = false;
+  m_upFill = 0;
+  m_upPath[0] = '\0';
+}
+
 void NetSvc::uploadChunk() {
   HTTPUpload& u = s_srv.upload();
   switch (u.status) {
@@ -336,6 +385,7 @@ void NetSvc::uploadChunk() {
       m_upActive = false;
       m_upDone = false;
       m_upBytes = 0;
+      m_upFill = 0;
       m_upPath[0] = '\0';
       if (!m_upOn) { m_upMsg = "上传服务未开启"; break; }
       char base[64];
@@ -356,30 +406,34 @@ void NetSvc::uploadChunk() {
 
     case UPLOAD_FILE_WRITE:
       if (!m_upActive) break;
-      if (m_upFile.write(u.buf, u.currentSize) != u.currentSize) {
-        m_upMsg = "写入失败（SD 卡满或写保护？）";
-        m_upFile.close();
-        SD_MMC.remove(m_upPath);
-        m_upActive = false;
-        m_upPath[0] = '\0';
-      }
+      if (!upWrite(u.buf, u.currentSize))
+        upAbort("SD 卡写入失败（卡无应答，疑似锁死）");
       break;
 
-    case UPLOAD_FILE_END:
+    case UPLOAD_FILE_END: {
       if (!m_upActive) break;
-      m_upBytes = u.totalSize;
-      m_upFile.close();
+      if (!upFlush()) { upAbort("SD 卡写入失败（卡无应答，疑似锁死）"); break; }
+      if (m_upBytes != u.totalSize) {
+        upAbort("SD 卡丢数据：写入字节数与上传不符");
+        break;
+      }
+      m_upFile.close();          // 文件 size 只在这一步提交（DESIGN 坑 18）
+      // 回读确认真的落盘了，否则页面会报"上传成功"而书库里躺着个 0 字节文件
+      m_upFile = SD_MMC.open(m_upPath, FILE_READ);
+      size_t sz = m_upFile ? m_upFile.size() : 0;
+      if (m_upFile) m_upFile.close();
+      if (sz != u.totalSize) {
+        upAbort("SD 卡写入未落盘：文件不完整，请断电重插后重传");
+        break;
+      }
       m_upActive = false;
       m_upDone = true;
+      Serial.printf("[net] upload ok: %s (%u bytes)\n", m_upPath, (unsigned)m_upBytes);
       break;
+    }
 
     case UPLOAD_FILE_ABORTED:
-      if (m_upActive) {
-        m_upFile.close();
-        SD_MMC.remove(m_upPath);
-        m_upActive = false;
-        m_upPath[0] = '\0';
-      }
+      if (m_upActive) upAbort(nullptr);   // 客户端断线：卡多半没事，顺手重挂干净
       if (!m_upMsg) m_upMsg = "上传中断";
       break;
   }
