@@ -17,6 +17,10 @@
 //
 // P4 书库/进度：开机扫 /books/*.txt + *.epub 成书库（串口 b 切下一本）；
 // 进度（路径+位置+页号+章号）存 NVS，每对页翻完/切书/深睡时写，开机按存档恢复。
+//
+// 系统菜单（NetSvc + SysMenu，DESIGN §8）：串口 m 开/关 —— 左页菜单右页状态，
+// WiFi 配置（热点配网页）/ WiFi 开关 / OTA 开关 / 网页上传电子书；
+// 菜单开着暂停自动翻页，合盖仍深睡（开盖回书页，菜单不跨睡）。
 
 #include <ESP32epdx.h>
 #include <Preferences.h>
@@ -31,6 +35,8 @@
 #include "src/PageStats.h"
 #include "src/DemoPage.h"
 #include "src/Storage.h"
+#include "src/NetSvc.h"
+#include "src/SysMenu.h"
 #include <SD_MMC.h>
 
 // === 引脚分配（DESIGN §1.1）===
@@ -68,6 +74,8 @@ RTC_DATA_ATTR int16_t s_sleepChapter = -1;   // ≥0 = EPUB 章号；-1 = TXT/�
 RTC_DATA_ATTR time_t s_sleepAt = 0;          // 入睡 wall-clock：醒后打印实际睡了
                                              // 多久（区分"秒级自醒=入睡毛刺"和
                                              // "分钟级=盖子真被打开过"）
+RTC_DATA_ATTR bool s_sleepMenu = false;      // 入睡时菜单还开着：屏上是菜单不是书页，
+                                             // 开盖跳过零闪烁恢复、走全刷回书页
 
 static const uint32_t FULL_EVERY = 5;        // 每 5 次快刷插 1 次全刷
 static const uint32_t PAGE_INTERVAL_MS = 5000;
@@ -142,7 +150,7 @@ static uint8_t g_size = TXT_SIZE_PX;   // 当前字号档（16/24/32）
 static int g_fam = 0;                  // 当前家族（0=classic）
 
 static void printFontState() {
-  Serial.printf("[font] family=%s size=%u book=%s (serial: f=font s=size b=next book h=status)\n",
+  Serial.printf("[font] family=%s size=%u book=%s (serial: f=font s=size b=next book m=menu h=status)\n",
                 CJK.familyName(g_fam), g_size,
                 s_libIdx >= 0 ? s_lib[s_libIdx].path : "-");
 }
@@ -242,10 +250,62 @@ static void runRefresh(bool fullMode) {
   harvestRx(fullMode ? "full refresh" : "fast refresh");
 }
 
+// 一次菜单刷新（内容 = menu.draw 进 draw 缓冲，其余节奏与 runRefresh 相同）。
+// fullMode：开菜单用全刷清残影；导航/动作用快刷（DTM1 = 屏上真实的菜单帧）
+static void showMenuRefresh(bool fullMode) {
+  menu.draw(fbDrawL, fbDrawR, s_nlib);
+
+  uint32_t t0 = millis();
+  bool ok = refreshPair(fullMode ? EinkPanel::FULL : EinkPanel::FAST);
+  uint32_t dt = millis() - t0;
+
+  stats.add(fullMode, dt, ok);
+  Serial.printf("menu %s refresh: %lu ms (%s)\n",
+                fullMode ? "full" : "fast", (unsigned long)dt,
+                ok ? "ok" : "TIMEOUT");
+  swapPair();
+  harvestRx("menu refresh");
+}
+
+// 网页上传完成（NetSvc 回调，loop 上下文）：重扫书库。
+// 覆盖的正是正在读的书 → 必须先关旧句柄再重开（新内容从第 0 对页起，旧进度作废）；
+// 否则重扫后 s_lib 下标可能位移，把当前书的下标找回来
+static void onBookAdded(const char* path) {
+  bool wasCur = book && s_libIdx >= 0 && !strcmp(path, s_lib[s_libIdx].path);
+  char cur[64] = "";
+  if (!wasCur && book && s_libIdx >= 0)
+    snprintf(cur, sizeof(cur), "%s", s_lib[s_libIdx].path);
+  if (wasCur) { book->close(); book = nullptr; bookOk = false; }
+
+  scanLibrary();
+
+  if (wasCur) {
+    int idx = -1;
+    for (int i = 0; i < s_nlib; i++)
+      if (!strcmp(path, s_lib[i].path)) { idx = i; break; }
+    bookOk = idx >= 0 && openBook(idx);
+    // 内容被换掉，旧进度对新文件没意义 → 清掉（重开本就从第 0 对页起）
+    if (bookOk) { prefs.remove("pos"); prefs.remove("page"); prefs.remove("ch"); }
+    Serial.printf("[up] current book replaced, reopen %s\n", bookOk ? "OK" : "FAILED");
+  } else if (cur[0]) {
+    s_libIdx = -1;
+    for (int i = 0; i < s_nlib; i++)
+      if (!strcmp(cur, s_lib[i].path)) { s_libIdx = i; break; }
+  }
+  // 菜单开着：右页"书库: N 本"要跟着变 → 重画（否则屏上状态过期）
+  if (menu.isOpen()) showMenuRefresh(false);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("=== dual e-ink book demo ===");
+
+  // RTC 跨醒保留：上次入睡时菜单还开着（屏上是菜单帧而非书页）→ 本醒不能走
+  // "零闪烁恢复"（fbShown 与屏上内容对不上，diff 会花），落到下方全刷回书页。
+  // 无条件清零：这标志只在入睡瞬间写一次
+  bool sleptWithMenu = s_sleepMenu;
+  s_sleepMenu = false;
 
   // 唤醒原因（开盖恢复路径的判定依据；非 EXT1 = 走冷启动 NVS 恢复，会全刷
   // 一次屏。上次唤醒日志里没有 [wake] EXT1 行、cause 未知 → 每次开机都打）
@@ -285,6 +345,11 @@ void setup() {
                 (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
                 (unsigned)ESP.getFreeHeap());
   prefs.begin("eink-book");
+
+  // 系统网络服务（菜单后端）：自带 NVS 命名空间 "eink-net"，WiFi 默认关
+  // （DESIGN §2 省电定案；菜单里手动开）。上传完成回调重扫书库
+  net.onBookAdded = onBookAdded;
+  net.begin();
 
   fbShownL = allocFrame();
   fbDrawL = allocFrame();
@@ -350,7 +415,9 @@ void setup() {
   // memcpy 到 fbShown —— shown = 屏幕真实内容，**不推送面板** → 恢复零闪烁，
   // 下一翻页的 diff/DTM1 也正确。屏从头到尾一直在显示，"开盖即恢复"
   bool resumed = false;
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+  if (sleptWithMenu)
+    Serial.println("[wake] slept with menu open - full refresh back to book page");
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 && !sleptWithMenu) {
     Serial.println("[wake] EXT1 (lid opened) - resuming book");
     bool restored = false;
     if (bookOk && s_sleepFilePos >= 0) {
@@ -400,6 +467,8 @@ static bool hallClosing() {
 
 // 合盖 → 存对页位置 → SPI 引脚 hold → EXT1(开盖) 深睡。不返回
 static void enterDeepSleep() {
+  s_sleepMenu = menu.isOpen();   // 屏上是菜单帧 → 记账，开盖走全刷回书页
+  net.beforeSleep();             // 停 WebServer/OTA、关 WiFi 射频（深睡不带电）
   saveProgress();
   s_sleepFilePos = bookOk ? book->pairFilePos() : -1;
   s_sleepPage    = bookOk ? book->pairPageNo() : 0;
@@ -451,7 +520,7 @@ static void nextBook() {
 
 // ===== 串口输入：命令分发 + 噪声窗口"收割验证" ===============================
 // 串口命令：f = 切字体家族（SD 包自动发现），s = 切字号 16/24/32，
-// b = 切下一本书，h = 状态（P6 4 键落地后绑同一套接口）
+// b = 切下一本书，m = 系统菜单，h = 状态（P6 4 键落地后绑同一套接口）
 // 三个输入窗口分开处理（P4 定案 2026-09-28）：
 //   · 等待期（5s 面板空闲，用户输入主窗口）→ handleSerial 每 20ms 轮询即时执行。
 //     原来只在等待前读一次，等待期收到的字节滞留到本轮刷新后被 drain 吞掉
@@ -463,6 +532,25 @@ static char g_rxQueue[4];   // 收割验证通过、待执行的命令
 static int g_rxN = 0;
 
 static void execSerialCmd(char c) {
+  // 菜单打开：字节全部交给菜单（j/k 导航、Enter/空格执行、q/m 退出；
+  // ESC 等杂字节被 key() 吞掉）—— f/s/b/h 在菜单期间刻意不响应
+  if (menu.isOpen()) {
+    SysMenu::Result r = menu.key(c);
+    if (r == SysMenu::REDRAW) {
+      showMenuRefresh(false);        // 导航/动作：快刷（DTM1 = 屏上真实菜单帧）
+    } else if (r == SysMenu::CLOSE) {
+      // 退出回书：restartPair 把当前对页重画进 draw 缓冲（不推进页码）；
+      // 失败（demo 页/首渲染前）就自然走下一对页
+      if (bookOk && book) book->restartPair();
+      runRefresh(false);
+    }
+    return;
+  }
+  if (c == 'm') {
+    menu.open();
+    showMenuRefresh(true);           // 开菜单：全刷，清上一帧残影
+    return;
+  }
   if (c == 'f' && CJK.familyCount() > 1) {
     g_fam = (g_fam + 1) % CJK.familyCount();
     if (book) book->setFamily(CJK.familyName(g_fam));
@@ -543,10 +631,15 @@ void loop() {
   uint32_t waitStart = millis();
   while (millis() - waitStart < PAGE_INTERVAL_MS) {
     handleSerial();
+    net.loop();                        // HTTP 分发 + OTA handle（只在等待窗跑，
+                                       // 上传/刷固件的闪存写全落在翻页间隙）
     if (hallClosing()) enterDeepSleep();   // 不返回
     delay(20);
   }
   if (hallClosing()) enterDeepSleep();
+
+  // 菜单开着：屏保持菜单，跳过自动翻页（下一轮照常轮询串口/网络/霍尔）
+  if (menu.isOpen()) return;
 
   pageCount++;
   runRefresh(pageCount % (FULL_EVERY + 1) == 0);
