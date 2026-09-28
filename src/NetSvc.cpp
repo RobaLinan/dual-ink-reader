@@ -365,8 +365,8 @@ bool NetSvc::upFlush() {
 // recover 失败就不删了（再 remove 又是一轮 5s 超时），留个 0 字节壳下次覆盖即可。
 void NetSvc::upAbort(const char* msg) {
   if (msg) m_upMsg = msg;
-  Serial.printf("[net] upload abort: %s (%s)\n", m_upPath,
-                m_upMsg ? m_upMsg : "中断");
+  Serial.printf("[net] upload abort: %s，已写 %u 字节（%s）\n", m_upPath,
+                (unsigned)m_upBytes, m_upMsg ? m_upMsg : "中断");
   m_upFile.close();                 // 卡死时这一步就会卡满一个 5s 命令超时，认了
   bool ok = Storage::recover();
   if (ok && m_upPath[0]) SD_MMC.remove(m_upPath);
