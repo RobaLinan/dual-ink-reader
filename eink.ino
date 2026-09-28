@@ -5,6 +5,7 @@
 //   DualEink   双屏重叠刷新 present()：L 灌帧→DRF→趁 L busy 给 R 灌帧→DRF→等两屏
 //   Storage    SDMMC 1-bit @20MHz 挂载（正式引脚 38/39/40）
 //   Book       统一书接口（TxtBook=TXT / EpubBook=EPUB，P4 起书库多书切换）
+//   EpubImg    EPUB 插图解码（JPEG=S3 ROM 硬件解码器 / PNG=PNGdec，Bayer 抖动落画布）
 //   PageStats  刷新耗时统计（min/avg/max + 超时，每 100 页汇总）
 //   DemoPage   兜底页码页（SD/书不可用时）
 //

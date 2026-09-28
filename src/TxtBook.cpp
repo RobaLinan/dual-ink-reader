@@ -38,6 +38,15 @@ static char s_line[256];
 static int s_lineLen = 0, s_px = 0, s_lines = 0;
 static bool s_pendingSpace = false;
 static long s_lineStart = 0, s_pageStart = 0;
+static long s_rewindPos = -1;   // 页尾回退位：图整页放不下时 = 图标记的文件位置
+                                // （-1 = 无。与 s_lineStart 回退互补，见 renderPage 尾部）
+static TxtBook::BookImgMeasureFn s_imgMeas = nullptr;   // EPUB 插图回调（EpubBook 注册）
+static TxtBook::BookImgDrawFn s_imgDraw = nullptr;
+static void* s_imgCtx = nullptr;
+
+void TxtBook::setImageFns(BookImgMeasureFn m, BookImgDrawFn d, void* ctx) {
+  s_imgMeas = m; s_imgDraw = d; s_imgCtx = ctx;
+}
 
 struct Tok { uint16_t off; uint16_t prePx; uint32_t wStart; };
 static Tok s_tok[MAXTOK];
@@ -287,6 +296,48 @@ static bool placeWord(const char* w, int len, uint32_t wStart) {
   return len == 0 || placeToken(w, len, pxOf(w, len), wStart);
 }
 
+// ---- EPUB 插图标记（转换期 EpubBook::collectText 把 <img> 写成独占一行的
+// ASCII 标记 [[img:<zip 内路径>]]：路径空格 %20 转义保证不被分词拆开，总长
+// ≤160B 行/词缓冲 192B 装得下；纯 TXT 正文不会出现 "[[" 前缀形态） ----
+static bool isImgMarker(const char* w, int len) {
+  return len > 8 && memcmp(w, "[[img:", 6) == 0 && w[len - 2] == ']' && w[len - 1] == ']';
+}
+
+// 图块落页：先画掉行内已有文本（图独占一行），量高度（不解码），
+// 放得下就绘制并按行高占位；放不下分两态——页首硬压进一页（防死循环），
+// 页中推给下一页顶部（s_rewindPos 回退）。
+// false = 本页到此为止（行文本未画走常规回退 / 图回退位已记录）
+static bool placeImageBlock(const char* path, int len, uint32_t wStart) {
+  char p[160];
+  if (len >= (int)sizeof(p)) len = (int)sizeof(p) - 1;
+  memcpy(p, path, len); p[len] = '\0';
+
+  if (s_lineLen > 0 && !flushLine()) return false;   // 页满：行未画，s_lineStart 回退
+  if (!s_imgMeas) return true;                       // 无解码器：跳过（防御）
+
+  int y = TXT_Y0 + s_lines * s_lineH;
+  int maxH = TXT_BOT - y;                            // 剩余垂直空间（循环条件保证 >0）
+  int h = 0;
+  if (!s_imgMeas(s_imgCtx, p, HARD_PX, &h) || h <= 0) return true;  // 坏图：跳过不阻塞
+  int need = (h + s_lineH - 1) / s_lineH;
+  int room = s_maxline - s_lines;
+  if (need > room) {
+    if (s_lines > 0) { s_rewindPos = (long)wStart; return false; }  // 推下一页整图画
+    need = room;                                     // 页首：再高的图也压进本页
+  }
+  int drawH = need * s_lineH;
+  if (drawH > maxH) drawH = maxH;                    // 几何兜底（截断后应不触发）
+  if (s_imgDraw) s_imgDraw(s_imgCtx, p, TXT_X, y, HARD_PX, drawH);
+  s_lines += need;
+  return true;
+}
+
+// 词收尾统一入口：认插图标记，其余照旧按词入版
+static bool placeContent(const char* w, int len, uint32_t wStart) {
+  if (isImgMarker(w, len)) return placeImageBlock(w + 6, len - 8, wStart);
+  return placeWord(w, len, wStart);
+}
+
 // ---- TxtBook ----
 // 行几何随字号档 + 家族联动：classic 用档位表；家族包用包内基线/行盒/maxAdv 度量。
 // 每页行数统一按墨迹盒算（换页高只动 TXT_BOT）：
@@ -469,6 +520,7 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
   m_hitEof = false;
   s_lineLen = 0; s_px = 0; s_lines = 0; s_ntok = 0;
   s_pendingSpace = false;
+  s_rewindPos = -1;
   s_pageStart = m_file.position();
   s_lineStart = s_pageStart;
 
@@ -496,18 +548,18 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
       }
     } else if (cp == '\n') {
       // 任一步骤因页满失败 → 立即停读；缓冲里有未画内容，页尾回退不丢字
-      if (!placeWord(word, wlen, wStart)) break;
+      if (!placeContent(word, wlen, wStart)) break;
       wlen = 0;
       if (!flushLine()) break;
       s_lineStart = m_file.position();
       s_pendingSpace = false;
     } else if (cp == ' ' || cp == '\t' || cp == '\r' || cp < 0x20 || cp == 0x3000) {
-      if (!placeWord(word, wlen, wStart)) break;
+      if (!placeContent(word, wlen, wStart)) break;
       wlen = 0;
       s_pendingSpace = true;
     } else if (isWide(cp)) {
       // 宽字符（汉字/全角标点）：独立 token，两端都是断点
-      if (!placeWord(word, wlen, wStart)) break;
+      if (!placeContent(word, wlen, wStart)) break;
       wlen = 0;
       if (!placeToken(raw, rawLen, s_cjkPx, (uint32_t)before)) break;
     } else {
@@ -517,19 +569,22 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
         memcpy(word + wlen, raw, rawLen);
         wlen += rawLen;
       } else {
-        if (!placeWord(word, wlen, wStart)) break;   // 超长 token 防溢出
+        if (!placeContent(word, wlen, wStart)) break;   // 超长 token 防溢出
         wlen = 0;
         if (!placeToken(raw, rawLen, advPx(cp), (uint32_t)before)) break;
       }
     }
     if (eof) {
-      if (wlen) { placeWord(word, wlen, wStart); wlen = 0; }
+      if (wlen) { placeContent(word, wlen, wStart); wlen = 0; }
       if (s_lineLen > 0 && s_lines < s_maxline) flushLine();
       break;
     }
   }
-  // 页满但末行没画完 → 回退到行首，下页从这里重读（不丢不重）
-  if (s_lineLen > 0) m_file.seek(s_lineStart);
+  // 页尾回退，两种互补：
+  //   s_rewindPos ≥ 0 = 图整页放不下（记录的是图标记位置）→ 留给下页顶部
+  //   s_lineLen > 0   = 末行没画完 → 回退到行首，下页从这里重读（不丢不重）
+  if (s_rewindPos >= 0) m_file.seek(s_rewindPos);
+  else if (s_lineLen > 0) m_file.seek(s_lineStart);
 
   Serial.printf("[txt] page %lu: pos %ld->%ld, %d lines, %lu ms\n",
                 (unsigned long)pageNo, s_pageStart, (long)m_file.position(),

@@ -55,6 +55,15 @@ public:
   // false = 渲染不出内容（此后 isOpen() 变 false）
   bool renderPair(uint8_t* fbL, uint8_t* fbR);
 
+  // —— EPUB 插图（EpubBook 注册；纯 TXT 不注册，正文流里也不会出现图标记）——
+  // measure = 按 maxW 宽探图的自然显示高（只读文件头，不解码整张），
+  //           false = 图不可用 → 排版跳过该图
+  // draw    = 解码 + 缩放进 (x,y,maxW,maxH) + 白底抖动绘制到当前 Paint 画布
+  //           （调用前必须已 Paint_SelectImage 目标帧缓冲）
+  typedef bool (*BookImgMeasureFn)(void* ctx, const char* path, int maxW, int* outH);
+  typedef bool (*BookImgDrawFn)(void* ctx, const char* path, int x, int y, int maxW, int maxH);
+  void setImageFns(BookImgMeasureFn m, BookImgDrawFn d, void* ctx);
+
   // —— P4 EPUB 复用接口（EpubBook 组合 TxtBook 排版引擎）——
   // 渲染单页（renderPair 的内部步进，EPUB 章末要在左右页之间插空白页）
   bool renderPage(uint8_t* fb, uint32_t pageNo);

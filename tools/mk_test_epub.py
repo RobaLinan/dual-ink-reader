@@ -4,7 +4,27 @@
 # 内容混入：中文段落（CJK 排版路径）、英文按词断行、HTML 实体（&nbsp; &ldquo; 等）、
 # 弯引号/长横线、<br/>、嵌套行内标签、<style>/<script>（应被整棵跳过）。
 # 用法：python3 tools/mk_test_epub.py → assets/books/test.epub
-import os, zipfile, textwrap
+import os, zipfile, textwrap, struct, zlib
+
+def test_png():
+    """真 PNG（纯标准库造）：400×240 竖向渐变 + 两个圆，验证解码 + 抖动梯度。
+    每张扫描线 = filter 字节 0 + RGB888 像素；zlib 压缩后手工组 IHDR/IDAT/IEND。"""
+    W, H = 400, 240
+    def chunk(typ, data):
+        c = struct.pack(">I", len(data)) + typ + data
+        return c + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+    raw = bytearray()
+    for y in range(H):
+        raw.append(0)
+        for x in range(W):
+            base = 255 - (y * 255 // H)                    # 上白下黑渐变
+            d1 = (x - 120) ** 2 + (y - 120) ** 2
+            d2 = (x - 280) ** 2 + (y - 120) ** 2
+            if d1 < 60 ** 2 or d2 < 60 ** 2: base = 40     # 两个深圆（硬边考缩放）
+            raw += bytes((base, base, base))
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)     # 8bit RGB
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "assets", "books", "test.epub")
 
@@ -42,6 +62,8 @@ def chapter_html(title, n_para, body_ratio=(2, 1)):
             parts.append("<p>第一行<br/>第二行<br/>第三行</p>\n")
         if i % 23 == 22:
             parts.append("<blockquote><p>引文：<em>嵌套行内标签</em>里的字也要抽出来。</p></blockquote>\n")
+        if i == 7:   # 插一张真图：src 用 ../ 相对路径（考 emitImageMarker 的路径折叠）
+            parts.append('<div class="fig"><img src="../images/pic.png" alt="灰阶测试图"/></div>\n')
     parts.append("</body></html>")
     return "".join(parts)
 
@@ -87,8 +109,8 @@ def build():
         z.writestr("OEBPS/content.opf", opf, compress_type=zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/toc.ncx", "<ncx xmlns='http://www.daisy.org/z3986/2005/ncx/'/>",
                    compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("OEBPS/images/pic.png", b"\x89PNG\r\n\x1a\n",   # 假图片
-                   compress_type=zipfile.ZIP_DEFLATED)             # manifest 有它但不进 spine
+        z.writestr("OEBPS/images/pic.png", test_png(),   # 真 PNG：解码+抖动验证素材
+                   compress_type=zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/text/ch1.xhtml", ch1, compress_type=zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/text/ch2.xhtml", ch2, compress_type=zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/text/ch3.xhtml", ch3, compress_type=zipfile.ZIP_DEFLATED)

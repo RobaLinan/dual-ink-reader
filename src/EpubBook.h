@@ -15,6 +15,10 @@
 //                   tinyxml2 解析 → 抽正文写 LittleFS 临时文本
 //                   → TxtBook 打开这个临时文本（翻页/中英混排/字体全家免费）
 //   renderPair()  = 章末（hitEof）下一对页自动进下一章；右页中道结束画空白页
+// 插图：<img>/<image>(svg) 在转换期写成 [[img:zip内路径]] 标记行，TxtBook 排版
+// 到标记时回调本类：解压图片条目到 LittleFS 临时文件 → EpubImg 解码（JPEG 走
+// S3 ROM 硬件解码器 / PNG 走 PNGdec）→ 等比缩放 + 4×4 Bayer 抖动落帧缓冲；
+// 量高度占位，页中放不下整图推下页，页首硬压进一页。GIF/WebP/渐进 JPEG 跳过。
 // 峰值 RAM = 章节缓冲 + DOM（都 PSRAM，DOM 池块打了 PSRAM 补丁见 VENDOR.md），
 // 解析完即释放；验收线：>280KB 章节读完一章不崩不 OOM。
 
@@ -48,8 +52,19 @@ private:
   bool loadChapter(uint16_t idx);      // 解压+解析+抽文本+交给 TxtBook
   bool nextChapter();                  // 推进一章（读完回卷第一章）
   bool parseOpf(const char* opfPath);  // 解析 OPF：标题/manifest/spine
-  bool convertChapterToText();         // XHTML 临时文件 → 纯文本临时文件
+  bool convertChapterToText(const char* docDir);  // XHTML 临时文件 → 纯文本临时文件
   bool extractWithRecovery(const char* zipPath, const char* outPath);  // 解压 + SD 读自救
+
+  // —— 插图（TxtBook 排版到图标记时回调；static trampoline 挂到 this）——
+  bool measureImage(const char* zipPath, int maxW, int* outH);  // 探尺寸算占位行数
+  bool drawImage(const char* zipPath, int x, int y, int maxW, int maxH);  // 解码绘制
+  bool ensureImageTmp(const char* zipPath);  // 解压到 LittleFS 临时文件（同路径复用）
+  static bool measTramp(void* ctx, const char* p, int w, int* h) {
+    return ((EpubBook*)ctx)->measureImage(p, w, h);
+  }
+  static bool drawTramp(void* ctx, const char* p, int x, int y, int w, int h) {
+    return ((EpubBook*)ctx)->drawImage(p, x, y, w, h);
+  }
 
   EpubZip m_zip;
   TxtBook m_txt;                       // 排版引擎（内部组合，接口对齐 Book）
@@ -74,6 +89,9 @@ private:
   char m_chapterPath[MAXCH][64];       // 每章 zip 内路径（256×64B = 16KB RAM）
   char m_path[64] = "";                // 当前书路径（SD 重挂后重开 zip 用）
   bool m_sdDead = false;               // 读探针判死：本会话不再探 SD（防连环超时）
+  char m_imgPath[160] = "";            // 已解压进 TEMP_IMG 的 zip 路径（缓存键）
+  bool m_imgCached = false;
+  bool m_imgOk = false;
 };
 
 #endif  // EPUB_BOOK_H

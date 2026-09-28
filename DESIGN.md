@@ -158,6 +158,26 @@ shown 永远 = 屏上真实内容）。
 >   第二章 444KB >280KB 验收线；混入中文/英文/实体/弯引号/br/嵌套/脚本）；
 >   主机端用同款代码 + vendored tinyxml2 验证：三章全解析成功、实体全替换、
 >   script/style 零泄漏、无三连空行
+
+**P4 插图（2026-09-28，编译过 + 主机端路径解析验证过 + 屏上首测过 → 首测揪出
+两个 bug 已修，见坑 21）**：
+- **管线**：转换期 `collectText` 遇到 `<img>`/`<image>`(svg 封面) 不写文本，
+  写 `[[img:zip内路径]]` 标记行（src 相对本章 XHTML 解析：`../` 折叠 + `#` 截
+  锚 + %XX 解码 + 空格转 %20 防拆词）→ TxtBook 排版到标记 = 独占一块行高：
+  回调量高（只读文件头）→ 页中放不下整图推下页（新 s_rewindPos 页尾回退，
+  与行回退互补）→ 页首硬压进一页防死循环 → EpubBook 解压图片条目到
+  LittleFS 临时文件（同路径缓存，防 restartPair 重复解压）→ `EpubImg` 解码
+- **解码**（详见 src/VENDOR.md）：JPEG = vendored **ChaN TJpgDec R0.03**
+  （块回调无整图缓冲，RGB565 输出，3.5KB 工作区；坑 19：S3 ROM 版 esp_rom_tjpgd
+  调试不可达已弃用——根因是 ChaN 输入回调"NULL buf = 跳字节"约定未实现）；
+  PNG = PNGdec 库（35KB 对象堆分配，栈放不下，坑 16 同因）。
+  两路都走 4×4 Bayer 有序抖动 → Paint_SetPixel 落帧缓冲（白底只点黑）；
+  渐进 JPEG / 隔行 PNG / GIF / WebP 跳过不阻塞排版
+- **主机端验证**：路径折叠镜像脚本对三本书全量过——test 3/3（含 ../ 引用）、
+  alice_rackham 42/42、christmas_carol 11/11（含 svg xlink:href 封面）全部
+  命中 zip 条目；三书图片路径最长 44B（标记 ≤52B，词缓冲 192B 无溢出）；
+  全部 JPEG 均 baseline、PNG 均非隔行（解码器可解）。test.epub 的假 8B pic.png
+  换成真 400×240 灰阶渐变 PNG（考缩放 + 抖动）
 > - **验收清单**（屏上，烧录后过）：①开test.epub 翻完 444KB 章不崩不 OOM
 >   （串口盯 `[epub] chapter ... psram free=` 与 `[mem]`）②章间翻页连续无重页
 >   ③合盖开盖回页（含章号）④`b` 切书 ⑤字体/字号切换即预览对 EPUB 生效
@@ -275,6 +295,26 @@ shown 永远 = 屏上真实内容）。
     = 毛刺自醒实锤**（醒来时电平已回落）；EXT1 醒 + hall=open = 盖子确实开着
     硬件侧排查（定案后再动手）：磁铁与 DRV5032 对位/气隙、合盖后轻敲看电平是否
     跳、GPIO4 走线远离屏升压。
+21. **EPUB 插图"糊成一片" + 翻到特定页重启（P4 屏上首测 2026-09-28，主机端复现
+    定案）**：两个独立 bug，alice_rackham.epub 上一个表现为显示糊、一个表现为翻到
+    title.png 那页堆崩：
+    ① **JPEG 对角涂抹（糊的根因）**：tjpgd 的 `JRECT` 是**闭区间**，`workbuf` 里
+    `rx×ry` 个像素紧凑排列、步进 = `right-left+1`；`EpubImg::jpgOut` 少写 `+1`
+    → 每行读取起点左移一格、逐行累积成 45° 斜纹，16×16 MCU 块还丢末行末列。
+    主机端用同款 vendored tjpgd 解 cover.jpg 对比新旧索引：**83.9% 像素不同**
+    （旧=斜纹糊成一片 / 新=清晰封面，`/tmp` 下 jpgtest）。顺带修：`JDEC jd` 未
+    初始化，而 Bodmer 补丁版 `jd_prepare` **保留**入参 `jd.swap`（先读后清零回填）
+    → 栈垃圾非 0 时 RGB565 整体字节交换、lum565 亮度全错；现显式 `memset`。
+    ② **PNGdec 奇数宽度越界写（崩的根因）**：`PNGRGB565` 调色板路径按 `x+=2`
+    （4bpp）/`x+=4`（2bpp）整组步进，奇数宽多写 1~3 个像素（上游库缺陷，未修）。
+    title.png = 373 宽（奇数）→ 恰好 2 字节写穿 `malloc(373*2)` 的尾部魔数，
+    下次 `free` 报 `CORRUPT HEAP: Bad tail ... 0xbaad5678 got 0xbaad0000` +
+    `multi_heap_free` 断言重启——日志里崩溃点正是 title.png 解码途中（页 4 有
+    提取记录却无 `[epub] image ... ok`）。主机端金丝雀实测：373 宽越 2 字节、
+    372/400 宽 0 字节，与设备日志逐字节吻合。缓解（库未改）：`pngDrawCb` 行缓冲
+    多留 4 像素吸收越界写，多出的垃圾像素不进画布。
+    **排查口诀**：屏上图"糊"先怀疑采样/索引（步进、坐标映射），别急着怪分辨率；
+    `CORRUPT HEAP ... Bad tail` = 精确越界 2~8 字节，先查行缓冲按宽度分配的地方。
 
 ## 6. 本地工具
 - 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default /home/roba/Arduino/eink`

@@ -3,6 +3,7 @@
 #include "SD_MMC.h"
 #include "EinkPanel.h"
 #include "CjkFont.h"
+#include "EpubImg.h"
 #include <ESP32epdx.h>
 #include <LittleFS.h>
 #include <string.h>
@@ -30,6 +31,7 @@ static const char* TEMP_CONTAINER = "/__c.xml";
 static const char* TEMP_OPF       = "/__o.opf";
 static const char* TEMP_XHTML     = "/__e.xhtml";
 static const char* TEMP_TXT       = "/__e.txt";
+static const char* TEMP_IMG       = "/__i.bin";   // 插图（解压到渲染同一张时复用）
 
 // ---- 文本汇：DOM 遍历 → LittleFS 临时文本，顺手做空白规范化 ----
 // XHTML 源码里缩进/换行全是排版噪音；规则：折叠空白为单空格、块级元素补 '\n'、
@@ -96,8 +98,62 @@ static bool isBlockTag(const char* n) {
   return false;
 }
 
+// ---- EPUB 插图标记：src(href) → zip 内路径 → 写 [[img:path]] 独占一行 ----
+// percentDecode 定义在本文件后部，先给原型（emitImageMarker 只在转换路径被调）
+static void percentDecode(char* s);
+
+// TxtBook 排版时认这行标记、量高占位、回调 EpubBook 解码绘制（白底 1bit 抖动）。
+// 路径处理：相对本章 XHTML（docDir 含尾 '/'）→ '../' 折叠（EPUB 图常放兄弟目录，
+// 如 OEBPS/text/ch1.xhtml 引 ../images/pic.png）→ '#锚' 截掉 → %XX 解码。
+// 路径里空格转 %20：空格会拆词，标记必须作为一个完整"词"过 TxtBook 的词缓冲。
+static void emitImageMarker(TextSink& sink, const char* docDir, const char* src) {
+  if (strncmp(src, "data:", 5) == 0 || strncmp(src, "http", 4) == 0) return;
+
+  char tmp[160];
+  if (src[0] == '/')
+    snprintf(tmp, sizeof(tmp), "%s", src + 1);   // zip 根开头的 '/' 去掉
+  else
+    snprintf(tmp, sizeof(tmp), "%s%s", docDir, src);
+  char* frag = strchr(tmp, '#');
+  if (frag) *frag = '\0';
+
+  // 折叠 ./ 和 ../：段指针栈，原地把 '/' 换 '\0'
+  char* seg[24]; int ns = 0;
+  for (char* p = tmp; *p && ns < 24; ) {
+    while (*p == '/') p++;
+    if (!*p) break;
+    char* start = p;
+    while (*p && *p != '/') p++;
+    int len = (int)(p - start);
+    if (len == 1 && start[0] == '.') continue;
+    if (len == 2 && start[0] == '.' && start[1] == '.') { if (ns > 0) ns--; continue; }
+    seg[ns++] = start;
+    if (*p) *p++ = '\0';
+  }
+  char path[160] = "";
+  for (int i = 0; i < ns; i++) {
+    if (path[0]) strncat(path, "/", sizeof(path) - strlen(path) - 1);
+    strncat(path, seg[i], sizeof(path) - strlen(path) - 1);
+  }
+  if (!path[0]) return;
+  percentDecode(path);
+  if (!path[0]) return;
+
+  sink.nl();
+  const char kMarker[] = "[[img:";
+  for (const char* p = kMarker; *p; p++) sink.put(*p);
+  for (const char* p = path; *p; p++) {
+    if (*p == ' ') { sink.put('%'); sink.put('2'); sink.put('0'); }
+    else sink.put(*p);
+  }
+  sink.put(']'); sink.put(']');
+  sink.nl();
+}
+
 // 遍历 DOM 抽正文。style/script/title/head 子树整棵跳过；body 内才是书。
-static void collectText(const XMLNode* node, TextSink& sink, bool inBody) {
+// <img>/<image>(svg 封面) 不抽文本，转成 [[img:...]] 标记行（图独占一行）。
+static void collectText(const XMLNode* node, TextSink& sink, bool inBody,
+                        const char* docDir) {
   for (const XMLNode* c = node->FirstChild(); c; c = c->NextSibling()) {
     const XMLText* t = c->ToText();
     if (t) { if (inBody) sink.text(t->Value()); continue; }
@@ -106,10 +162,17 @@ static void collectText(const XMLNode* node, TextSink& sink, bool inBody) {
     const char* name = e->Name();
     if (!name) continue;
     if (strcmp(name, "style") == 0 || strcmp(name, "script") == 0) continue;
-    if (strcmp(name, "body") == 0) { collectText(e, sink, true); sink.nl(); continue; }
-    if (!inBody) { collectText(e, sink, false); continue; }   // head/title 等不进正文
+    if (strcmp(name, "body") == 0) { collectText(e, sink, true, docDir); sink.nl(); continue; }
+    if (!inBody) { collectText(e, sink, false, docDir); continue; }   // head/title 等不进正文
     if (strcmp(name, "br") == 0) { sink.nl(); continue; }
-    collectText(e, sink, true);
+    if (strcmp(name, "img") == 0 || strcmp(name, "image") == 0) {
+      const char* src = e->Attribute("src");
+      if (!src) src = e->Attribute("xlink:href");   // svg <image xlink:href=...>
+      if (!src) src = e->Attribute("href");
+      if (src) emitImageMarker(sink, docDir, src);
+      continue;                                     // 图元素无文本子节点
+    }
+    collectText(e, sink, true, docDir);
     if (isBlockTag(name)) sink.nl();
   }
 }
@@ -211,6 +274,7 @@ bool EpubBook::open(const char* path) {
   snprintf(s_openPath, sizeof(s_openPath), "%s", path);
   snprintf(m_path, sizeof(m_path), "%s", path);   // 重挂自救时重开 zip 用
   m_sdDead = false;                               // 新一轮书会话，给 SD 重新判活机会
+  m_imgCached = false;                            // 插图临时文件缓存键随书重置
 
   if (!m_zip.open(path)) { s_openPath[0] = '\0'; return false; }
 
@@ -279,6 +343,8 @@ void EpubBook::close() {
   m_txt.close();
   m_zip.close();
   m_ok = false;
+  tempFs().remove(TEMP_IMG);       // 插图临时文件随书关闭作废
+  m_imgCached = false; m_imgPath[0] = '\0';
 }
 
 // ---- 解压 + SD 失败自救 --------------------------------------------------
@@ -414,7 +480,8 @@ bool EpubBook::parseOpf(const char* opfPath) {
 }
 
 // XHTML 临时文件 → 纯文本临时文件（tinyxml2 为主，剥标签兜底）
-bool EpubBook::convertChapterToText() {
+// docDir = 本章 XHTML 所在 zip 内目录（插图 href 相对它解析，含尾 '/'）
+bool EpubBook::convertChapterToText(const char* docDir) {
   File xf = tempFs().open(TEMP_XHTML, FILE_READ);
   if (!xf) return false;
   size_t xsize = xf.size();
@@ -438,7 +505,7 @@ bool EpubBook::convertChapterToText() {
     if (doc.Parse(start) == XML_SUCCESS) {
       TextSink sink;
       if (sink.open(tempFs(), TEMP_TXT)) {
-        collectText(&doc, sink, false);
+        collectText(&doc, sink, false, docDir);
         sink.close();
         ok = !sink.err();          // 临时文件写停摆 → 文本不完整 → 判坏章
         if (!ok) Serial.println("WARN: chapter text write failed");
@@ -467,7 +534,19 @@ bool EpubBook::loadChapter(uint16_t idx) {
                    // 两处同开一个文件不干净；转换失败时旧章文本也别留在渲染路径上
   extractWithRecovery(m_chapterPath[idx], TEMP_XHTML) ||
       Serial.printf("WARN: extract failed: %s\n", m_chapterPath[idx]);
-  bool ok = convertChapterToText();
+
+  // 本章 XHTML 所在 zip 内目录（插图 href 相对它解析）
+  char docDir[64] = "";
+  {
+    const char* slash = strrchr(m_chapterPath[idx], '/');
+    if (slash) {
+      size_t n = (size_t)(slash - m_chapterPath[idx]) + 1;
+      if (n >= sizeof(docDir)) n = sizeof(docDir) - 1;
+      memcpy(docDir, m_chapterPath[idx], n); docDir[n] = '\0';
+    }
+  }
+
+  bool ok = convertChapterToText(docDir);
   tempFs().remove(TEMP_XHTML);
   if (!ok) return false;
 
@@ -476,12 +555,41 @@ bool EpubBook::loadChapter(uint16_t idx) {
   m_txt.setLoop(false);            // 章末停住，由本类推进下一章
   m_txt.setTier(m_tier);
   m_txt.setFamily(m_family);
+  m_txt.setImageFns(measTramp, drawTramp, this);   // 图标记 → 本类解码绘制
   char hdr[40];
   snprintf(hdr, sizeof(hdr), "%s ch%u", m_title, (unsigned)idx + 1);
   m_txt.setTitle(hdr);
   m_chapter = idx;
   m_chapterDone = false;
   return true;
+}
+
+// ---- 插图解码回调（TxtBook 排版到 [[img:...]] 标记时经 trampoline 进来）----
+// 流程：zip 条目 →（同路径缓存跳过重复解压）→ LittleFS 临时文件 → EpubImg 探尺寸/解码
+bool EpubBook::ensureImageTmp(const char* zipPath) {
+  if (m_imgCached && strcmp(m_imgPath, zipPath) == 0) return m_imgOk;
+  m_imgCached = true;
+  snprintf(m_imgPath, sizeof(m_imgPath), "%s", zipPath);
+  tempFs().remove(TEMP_IMG);
+  m_imgOk = extractWithRecovery(zipPath, TEMP_IMG);
+  return m_imgOk;
+}
+
+bool EpubBook::measureImage(const char* zipPath, int maxW, int* outH) {
+  if (!ensureImageTmp(zipPath)) return false;
+  int iw = 0, ih = 0;
+  if (!EpubImg::probe(TEMP_IMG, &iw, &ih)) return false;   // 不支持的格式/坏图
+  *outH = iw >= maxW ? (int)((int64_t)ih * maxW / iw) : ih;  // 宽贴满的自然高（小图不放大）
+  return true;
+}
+
+bool EpubBook::drawImage(const char* zipPath, int x, int y, int maxW, int maxH) {
+  if (!ensureImageTmp(zipPath)) return false;
+  uint32_t t0 = millis();
+  bool ok = EpubImg::draw(TEMP_IMG, x, y, maxW, maxH);
+  Serial.printf("[epub] image %s: %s (%lu ms)\n", zipPath, ok ? "ok" : "FAIL",
+                (unsigned long)(millis() - t0));
+  return ok;
 }
 
 bool EpubBook::nextChapter() {
