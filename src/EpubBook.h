@@ -10,8 +10,9 @@
 //
 // 架构 = "一章一转换"，复用 TxtBook 排版引擎，绝不整本常驻：
 //   open()        = 打开 zip → container.xml → OPF → spine（章列表）
-//   loadChapter() = miniz 流式解压该章 XHTML 到 SD 临时文件（坑 6）
-//                   → 整章读进 PSRAM → tinyxml2 解析 → 抽正文写 SD 临时文本
+//   loadChapter() = miniz 流式解压该章 XHTML 到片内 LittleFS 临时文件（坑 6；
+//                   坑 18：EPUB 不写 SD，写 SD 会物理锁卡）→ 整章读进 PSRAM →
+//                   tinyxml2 解析 → 抽正文写 LittleFS 临时文本
 //                   → TxtBook 打开这个临时文本（翻页/中英混排/字体全家免费）
 //   renderPair()  = 章末（hitEof）下一对页自动进下一章；右页中道结束画空白页
 // 峰值 RAM = 章节缓冲 + DOM（都 PSRAM，DOM 池块打了 PSRAM 补丁见 VENDOR.md），
@@ -48,7 +49,7 @@ private:
   bool nextChapter();                  // 推进一章（读完回卷第一章）
   bool parseOpf(const char* opfPath);  // 解析 OPF：标题/manifest/spine
   bool convertChapterToText();         // XHTML 临时文件 → 纯文本临时文件
-  bool extractWithRecovery(const char* zipPath, const char* outPath);  // SD 写自救
+  bool extractWithRecovery(const char* zipPath, const char* outPath);  // 解压 + SD 读自救
 
   EpubZip m_zip;
   TxtBook m_txt;                       // 排版引擎（内部组合，接口对齐 Book）
@@ -72,7 +73,7 @@ private:
   char m_opfDir[48] = "";              // OPF 所在 zip 内目录（href 拼接用）
   char m_chapterPath[MAXCH][64];       // 每章 zip 内路径（256×64B = 16KB RAM）
   char m_path[64] = "";                // 当前书路径（SD 重挂后重开 zip 用）
-  bool m_sdDead = false;               // 读探针判死：本会话不再碰 SD 写（防连环超时）
+  bool m_sdDead = false;               // 读探针判死：本会话不再探 SD（防连环超时）
 };
 
 #endif  // EPUB_BOOK_H

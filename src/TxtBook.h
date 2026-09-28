@@ -24,6 +24,9 @@ class TxtBook : public Book {
 public:
   // 挂载 SD 并打开 path。false = 卡/文件问题（不 fatal，调用方退 demo 页）
   bool open(const char* path);
+  // 从任意 FS 打开（EPUB 章节文本在片内 LittleFS 临时文件，DESIGN 坑 18）。
+  // 字库仍从 SD 读（CJK.begin 内部），Storage 挂载逻辑不变
+  bool open(fs::FS& fs, const char* path);
   bool isOpen() const { return m_ok; }
   void close() override;               // 关文件句柄（切书/SD 重挂载前）；进度状态保留
 

@@ -18,6 +18,7 @@
 #include <Preferences.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
+#include <sys/time.h>   // gettimeofday：入睡/醒后时间戳，算深睡时长（自醒取证）
 #include "src/EinkPanel.h"
 #include "src/DualEink.h"
 #include "src/TxtBook.h"
@@ -60,6 +61,9 @@ static const int SLEEP_HOLD_PINS[] = {EINK_SCK, EINK_MOSI,
 RTC_DATA_ATTR long s_sleepFilePos = -1;
 RTC_DATA_ATTR uint32_t s_sleepPage = 0;
 RTC_DATA_ATTR int16_t s_sleepChapter = -1;   // ≥0 = EPUB 章号；-1 = TXT/无
+RTC_DATA_ATTR time_t s_sleepAt = 0;          // 入睡 wall-clock：醒后打印实际睡了
+                                             // 多久（区分"秒级自醒=入睡毛刺"和
+                                             // "分钟级=盖子真被打开过"）
 
 static const uint32_t FULL_EVERY = 5;        // 每 5 次快刷插 1 次全刷
 static const uint32_t PAGE_INTERVAL_MS = 5000;
@@ -208,6 +212,10 @@ static void swapPair() {
   t = fbShownR; fbShownR = fbDrawR; fbDrawR = t;
 }
 
+// 收割验证入口（定义见下方 handleSerial 区）：刷新/开机噪声窗口只放行
+// "恰好一个命令字符 + 换行"形态的用户输入，裸字节/乱码打 hex 丢弃
+static void harvestRx(const char* why);
+
 // 一轮：出内容 → 刷新 → 计时统计 → 双缓冲换挡
 static void runRefresh(bool fullMode) {
   preparePages(fullMode);
@@ -222,12 +230,35 @@ static void runRefresh(bool fullMode) {
                 dualOk ? " L+R" : " L", (unsigned long)dt,
                 ok ? "ok" : "TIMEOUT");
   swapPair();
+
+  // 刷新期间 SPI 灌帧 + 升压高压疑似串扰 RX0（GPIO44），凭空灌进假命令字节
+  // （P4 唤醒实测：幽灵 'b'/'h' 都出现在开机窗口；刷新窗口同样设防）。
+  // 收割验证：带换行的完整命令（用户在刷新窗口内抢发的 b/f/s/h）入队照常执行，
+  // 裸字节/乱码（噪声形态）打十六进制丢弃 —— 防误切书且不吞用户输入
+  harvestRx(fullMode ? "full refresh" : "fast refresh");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("=== dual e-ink book demo ===");
+
+  // 唤醒原因（开盖恢复路径的判定依据；非 EXT1 = 走冷启动 NVS 恢复，会全刷
+  // 一次屏。上次唤醒日志里没有 [wake] EXT1 行、cause 未知 → 每次开机都打）
+  int wc = (int)esp_sleep_get_wakeup_cause();
+  Serial.printf("[wake] cause=%d%s\n", wc,
+                wc == (int)ESP_SLEEP_WAKEUP_EXT1 ? " (EXT1: lid)" : " (not EXT1)");
+  // 自醒取证（2026-09-28 首次深睡无故自醒，醒后霍尔读开盖 >10s）：
+  // ① 睡了多久 —— 秒级 = 入睡瞬间毛刺/电平边际；分钟级 = 盖子真被打开过
+  // ② EXT1 触发脚位掩码 —— 确认是 GPIO4 而不是别的脚
+  if (wc == (int)ESP_SLEEP_WAKEUP_EXT1)
+    Serial.printf("[wake] ext1 pins=0x%llx\n",
+                  (unsigned long long)esp_sleep_get_ext1_wakeup_status());
+  if (s_sleepAt > 0) {
+    struct timeval now;
+    if (gettimeofday(&now, nullptr) == 0)
+      Serial.printf("[wake] slept %ld s\n", (long)(now.tv_sec - s_sleepAt));
+  }
 
   // 最先释放深睡 hold：EXT1 唤醒/外部 RST 后 hold 残留在 RTC 域，不放开会把
   // SPI 脚锁死在睡眠电平 → 屏 SPI 废掉，恢复渲染/翻页全挂（无 hold 状态下
@@ -237,6 +268,13 @@ void setup() {
   gpio_deep_sleep_hold_dis();
 
   pinMode(PIN_HALL, INPUT);   // DRV5032 推挽输出，不需内部上拉
+  // 唤醒瞬间的霍尔电平：EXT1 醒 + hall=开盖 = 盖子确实开着（或磁铁没对上）；
+  // EXT1 醒 + hall=合盖 = 毛刺自醒实锤（醒来时电平已回落）
+  int hl = digitalRead(PIN_HALL);
+  Serial.printf("[wake] hall=%d (%s)%s\n", hl,
+                hl == HALL_CLOSED_LEVEL ? "closed" : "open",
+                (wc == (int)ESP_SLEEP_WAKEUP_EXT1 && hl == HALL_CLOSED_LEVEL)
+                    ? " <- EXT1 woke but lid reads CLOSED (spurious?)" : "");
   // total=0 → PSRAM 没初始化（OPI 失败/板型不符）；2097152 → 2MB 板；
   // 8388608 → N16R8 正常。unifont 2MB 装不装得下全看这行
   Serial.printf("[mem] PSRAM total=%u free=%u | heap free=%u\n",
@@ -339,6 +377,10 @@ void setup() {
     if (!restored) book->restartPair();   // 无有效存档：从第 0 对页开始
   }
   if (!resumed) runRefresh(true);
+  // setup 期间（面板初始化/章节解压/全刷升压）攒下的 RX 字节过一遍账再进 loop：
+  // 收割验证 —— 用户开机电前抢发的完整命令（"b\n"）入队补执行，裸字节当噪声丢弃
+  // （P4 幽灵 'b'/'h' 实际就在这个窗口入栈）
+  harvestRx("boot");
 }
 
 // 合盖检测：稳定在合盖电平 300ms（防抖）才返回 true
@@ -359,6 +401,10 @@ static void enterDeepSleep() {
                 (unsigned long)millis(), s_sleepFilePos, (unsigned long)s_sleepPage,
                 (int)s_sleepChapter);
   if (Serial) Serial.flush();
+  {   // 记录入睡 wall-clock（RTC 时钟深睡期间照走，醒后算实际睡眠时长）
+    struct timeval tv;
+    if (gettimeofday(&tv, nullptr) == 0) s_sleepAt = tv.tv_sec;
+  }
 
   gpio_deep_sleep_hold_en();
   for (size_t i = 0; i < sizeof(SLEEP_HOLD_PINS) / sizeof(SLEEP_HOLD_PINS[0]); i++) {
@@ -396,40 +442,103 @@ static void nextBook() {
   runRefresh(true);
 }
 
+// ===== 串口输入：命令分发 + 噪声窗口"收割验证" ===============================
 // 串口命令：f = 切字体家族（SD 包自动发现），s = 切字号 16/24/32，
 // b = 切下一本书，h = 状态（P6 4 键落地后绑同一套接口）
+// 三个输入窗口分开处理（P4 定案 2026-09-28）：
+//   · 等待期（5s 面板空闲，用户输入主窗口）→ handleSerial 每 20ms 轮询即时执行。
+//     原来只在等待前读一次，等待期收到的字节滞留到本轮刷新后被 drain 吞掉
+//     （实测 7 个 'b' 全被吞 = "发 b 不能切书"的根因）
+//   · 刷新期/开机期（SPI+升压窗口，幽灵字节唯一证据来源：开机窗口入栈的裸
+//     'b'/'h'）→ harvestRx 收割：只有"恰好一个命令字符 + 换行"（终端实测发
+//     62 0a）才入队放行，裸字节/乱码打 hex 丢弃 —— 用户输入不丢，噪声过不去
+static char g_rxQueue[4];   // 收割验证通过、待执行的命令
+static int g_rxN = 0;
+
+static void execSerialCmd(char c) {
+  if (c == 'f' && CJK.familyCount() > 1) {
+    g_fam = (g_fam + 1) % CJK.familyCount();
+    if (book) book->setFamily(CJK.familyName(g_fam));
+    g_fam = CJK.currentFamily();              // 包装载失败会自动回 classic
+    prefs.putString("font", CJK.familyName(g_fam));
+    printFontState();
+    previewFontChange();
+  } else if (c == 's') {
+    g_size = (g_size == 16) ? 24 : (g_size == 24 ? 32 : 16);
+    if (book) book->setTier(g_size);
+    g_fam = CJK.currentFamily();
+    prefs.putUChar("size", g_size);
+    printFontState();
+    previewFontChange();
+  } else if (c == 'b') {
+    nextBook();
+  } else if (c == 'h') {
+    printFontState();
+  }
+}
+
+// 收割当前 RX 缓冲（刷新后/开机时调用）：验证通过入队，否则打日志丢弃
+static void harvestRx(const char* why) {
+  if (!Serial.available()) return;
+  char in[32];
+  int n = 0, c;
+  while (n < (int)sizeof(in) && (c = Serial.read()) >= 0) in[n++] = (char)c;
+  int cmds = 0;
+  char cmd = 0;
+  bool nl = false;
+  for (int i = 0; i < n; i++) {
+    if (in[i] == '\n' || in[i] == '\r') { nl = true; continue; }
+    cmd = in[i]; cmds++;
+  }
+  // 纯换行 = 用户命令的尾字节（b 被等待窗读走执行、\n 滞留进刷新窗口），
+  // 不是噪声也不是命令 —— 单独记一笔，别混进 dropped 里误导排查
+  if (cmds == 0 && nl) {
+    Serial.printf("[rx] ignore %d newline byte(s) after %s\n", n, why);
+    return;
+  }
+  if (cmds == 1 && nl && g_rxN < (int)sizeof(g_rxQueue)) {
+    g_rxQueue[g_rxN++] = cmd;
+    Serial.printf("[rx] '%c' queued after %s\n", cmd, why);
+    return;
+  }
+  char hex[72] = "";
+  int k = 0;
+  for (int i = 0; i < n && k < (int)sizeof(hex) - 4; i++)
+    k += snprintf(hex + k, sizeof(hex) - k, "%02x ", (uint8_t)in[i]);
+  Serial.printf("[rx] dropped %d byte(s) after %s: %s\n", n, why, hex);
+}
+
+// 命令入口：先执行收割队列（较早到达），再读实时字节（等待期窗口）
 static void handleSerial() {
+  while (g_rxN > 0) {
+    char c = g_rxQueue[0];
+    g_rxN--;
+    memmove(g_rxQueue, g_rxQueue + 1, g_rxN);
+    Serial.printf("[rx] exec '%c' (queued)\n", c);
+    execSerialCmd(c);
+  }
   while (Serial.available()) {
-    char c = Serial.read();
-    if (c == 'f' && CJK.familyCount() > 1) {
-      g_fam = (g_fam + 1) % CJK.familyCount();
-      if (book) book->setFamily(CJK.familyName(g_fam));
-      g_fam = CJK.currentFamily();              // 包装载失败会自动回 classic
-      prefs.putString("font", CJK.familyName(g_fam));
-      printFontState();
-      previewFontChange();
-    } else if (c == 's') {
-      g_size = (g_size == 16) ? 24 : (g_size == 24 ? 32 : 16);
-      if (book) book->setTier(g_size);
-      g_fam = CJK.currentFamily();
-      prefs.putUChar("size", g_size);
-      printFontState();
-      previewFontChange();
-    } else if (c == 'b') {
-      nextBook();
-    } else if (c == 'h') {
-      printFontState();
-    }
+    int raw = Serial.read();
+    if (raw < 0) break;
+    char c = (char)raw;
+    Serial.printf("[rx] cmd 0x%02x ('%c')\n", raw,
+                  (raw >= 32 && raw < 127) ? c : '?');
+    execSerialCmd(c);
   }
 }
 
 void loop() {
-  handleSerial();
-
-  // 分片等待下一次翻页，每 20ms 查一次霍尔：合盖 300ms 防抖 → 深睡（不返回）。
-  // 原来一整段 delay(5s) 期间是聋的，合盖要等最多 5s 才睡
+  // 分片等待下一次翻页，每 20ms 查一次霍尔 + 轮询一次串口：
+  //   · 合盖 300ms 防抖 → 深睡（不返回）；原来整段 delay(5s) 期间是聋的
+  //   · 串口必须在等待期内轮询（P4 回归根因）：原来 handleSerial 只在 loop 顶部
+  //     跑一次，等待期（5s，用户输入主窗口）收到的字节滞留到本轮刷新结束才被
+  //     收割窗口碰到 —— 7 个 'b\n' 全被当噪声吞掉，"b 切书"100% 失效
   uint32_t waitStart = millis();
-  while (!hallClosing() && millis() - waitStart < PAGE_INTERVAL_MS) delay(20);
+  while (millis() - waitStart < PAGE_INTERVAL_MS) {
+    handleSerial();
+    if (hallClosing()) enterDeepSleep();   // 不返回
+    delay(20);
+  }
   if (hallClosing()) enterDeepSleep();
 
   pageCount++;

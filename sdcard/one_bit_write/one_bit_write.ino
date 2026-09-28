@@ -1,9 +1,13 @@
+// SD 写路径专项测试（硬件排查工具，不随主固件烧录）。
+// 引脚与正式接线一致（WIRING §1：38/39/40），DESIGN 坑 18 的"当前引脚写入
+// 是否锁卡"用它复测：能写 2MB = 硬件 OK；中途 0x109/0x107 = 写路径仍挂
+// （卡 VDD 去耦/上拉/换卡/把 SD_MMC.begin 的 20000 降到 10000 再试）
 #include "FS.h"
 #include "SD_MMC.h"
 
-#define SD_MMC_CLK 12
-#define SD_MMC_CMD 11
-#define SD_MMC_D0  10
+#define SD_MMC_CLK 38
+#define SD_MMC_CMD 39
+#define SD_MMC_D0  40
 
 void setup() {
   Serial.begin(115200);

@@ -329,13 +329,16 @@ void TxtBook::close() {
   m_ok = false;
 }
 
-bool TxtBook::open(const char* path) {
-  if (m_ok) {              // 允许重开（EpubBook 每章换临时文本文件）
-    close();
-    m_hitEof = false;
-    m_page = 0;
-    m_pairStart = -1;
-  }
+bool TxtBook::open(const char* path) { return open(SD_MMC, path); }
+
+bool TxtBook::open(fs::FS& fs, const char* path) {
+  if (m_ok) close();          // 允许重开（EpubBook 每章换临时文本文件）
+  // 流式状态每次 open 归零（原逻辑只在"开着时重开"分支里重置 → 先 close 再
+  // open 会把上一章的 m_hitEof/m_pairStart 带进新章，EPUB 右页会误判章末）；
+  // m_page/m_pairStart 的恢复由调用方显式 restorePair 做，open 不该继承
+  m_hitEof = false;
+  m_page = 0;
+  m_pairStart = -1;
   if (!Storage::begin()) return false;
 
   setTier(TXT_SIZE_PX);            // 默认档（TxtBook.h 可改），按键阶段可运行期切换
@@ -344,14 +347,15 @@ bool TxtBook::open(const char* path) {
   // 成功后首开 /books/test_cn.txt 失败、下一个候选却秒开）。100ms 退避重试
   for (int i = 0; i < 3 && !m_file; i++) {
     if (i) delay(100);
-    m_file = SD_MMC.open(path, FILE_READ);
+    m_file = fs.open(path, FILE_READ);
   }
   if (!m_file) {
-    Serial.printf("WARN: %s not found on SD card\n", path);
+    Serial.printf("WARN: cannot open %s\n", path);
     return false;
   }
   m_ok = true;
-  Serial.printf("[SD] %s: %lu bytes\n", path, (unsigned long)m_file.size());
+  if (!m_quiet)   // EPUB 章节临时文件（setQuiet 在 open 前置位）不刷这行
+    Serial.printf("[SD] %s: %lu bytes\n", path, (unsigned long)m_file.size());
 
   const char* base = path[0] == '/' ? path + 1 : path;
   if (!m_titleOverridden)

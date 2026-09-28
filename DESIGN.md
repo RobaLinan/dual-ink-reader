@@ -128,9 +128,10 @@ shown 永远 = 屏上真实内容）。
 >   `_charBuffer` 文档缓冲走 ps_malloc，失败回退 malloc——>280KB 章节的 DOM
 >   不挤 250KB DRAM；补丁位置/升级注意见 src/VENDOR.md）
 > - **一章一转换**（`EpubBook` 组合 `TxtBook`，排版引擎零重写）：
->   miniz 流式解压章 XHTML → SD 临时文件（坑 6 定案路径）→ 整章读进 PSRAM
+>   miniz 流式解压章 XHTML → 片内 LittleFS 临时文件（坑 6 定案路径；**坑 18
+>   起临时文件不写 SD**，SD 写会物理锁卡）→ 整章读进 PSRAM
 >   （444KB 实测装得下）→ tinyxml2 解析 → DOM 抽正文（跳过 style/script/head，
->   块级补 \n，空白折叠，连续空行封顶 2）→ 2KB 缓冲写 SD 临时文本 → TxtBook
+>   块级补 \n，空白折叠，连续空行封顶 2）→ 2KB 缓冲写 LittleFS 临时文本 → TxtBook
 >   当 TXT 翻（三档字号/四家族/避头尾全继承）。解析失败自动降级"剥标签"兜底
 > - **章末推进**：TxtBook 加 setLoop(false)/hitEof()；右页中道结束画空白页，
 >   下一对页自动进下一章，坏章自动跳过（guard 防死循环），全书读完回卷
@@ -181,10 +182,13 @@ shown 永远 = 屏上真实内容）。
    切换：串口 `f`=换家族 `s`=换字号（P6 4 键落地后绑同一接口），选择存 NVS 断电保留；
    `restartPair()` 回跳当前对页立即重排 = 切换即预览。家族 classic/serif/sans/kai
    四款全就绪（kai=霞鹜文楷 43433 字形，2026-09-24）。 ink 出界自兜底（x≤647/y≤479，Paint 边界是 > 不是 ≥）。
-6. EPUB >280KB 章节崩分配器（atomic14 #73）→ 先解压到 SD 临时文件再流式
+6. EPUB >280KB 章节崩分配器（atomic14 #73）→ 先解压到临时文件再流式（坑 18 后 = 片内 LittleFS）
 7. SDMMC × core 2.0.17 × S3 兼容性 → **P3 首验（2026-09-21）：4-bit 不稳定，定案 1-bit @20MHz；写 2MB / 1417ms ≈ 1.41MB/s**。**二验（2026-09-24）：正式引脚 38/39/40 挂载成功，/test.txt(151KB) 流式分页正常（24 行/页，读+渲染 ~30ms/页，对比 1.3s 刷屏可忽略）**。
    ⚠️ 踩坑：初始化 `0x107`（卡无应答）→ **CMD/D0 需要内部上拉兜底**（`pinMode(INPUT_PULLUP)` 再 `setPins`）——模块没焊总线上拉时 CMD 浮空；8.21 的 one_bit_write 带这两行、初版 Storage 漏抄。D1/D2/D3 悬空无妨（1-bit 用不到）。
-   待补：读速专项实测、写后读回校验、深睡唤醒后重新挂载；真不稳再回退 SPI（接口不变）
+   **写后读回校验 → P4 首测未过（2026-09-28，坑 18）**：正式引脚写 ~3KB 即 0x109
+   锁卡；EPUB 已改片内 LittleFS 临时文件绕开 SD 写。
+   待补：读速专项实测、深睡唤醒后重新挂载；写路径硬件复测用
+   `sdcard/one_bit_write`（已改 38/39/40）；真不稳再回退 SPI（接口不变）
 8. 同型号两块屏 VCOM 不一致 → CDI(0x50) 左右分开标定（Diptyx 做法）
 9. 残影 → 每 5 次快刷插一次全刷
 10. `0xE5` 强制温度 → 对比度略降；后续用面板温度传感器（0x40 TSC/0x43 TSR）补偿
@@ -208,6 +212,53 @@ shown 永远 = 屏上真实内容）。
     `extract_iter_new/read/free`（解压器状态在堆分配的 iter_state 里），零补丁，
     详见 `src/VENDOR.md`。**排查口诀**：EPUB 独有路径崩 = 先查 miniz/tinyxml2 的
     栈上大数组，TXT 路径不经过它们所以"之前一直没事"
+17. miniz 32 位堆越界（上游 richgel999/miniz#371，**未发布修复**）：`tinfl_decompress`
+    在 xtensa 32 位上写越 `tinfl_decompressor` 尾部（64 位主机不复现），落在
+    `mz_zip_reader_extract_iter_state` 尾部字段上 → `file_crc32` 被踩成确定性
+    字节序列，`iter_free` 的 CRC 校验必败。两段缓解（`EpubZip.cpp` 头注释）：
+    ① 所有 miniz 分配 +4096 超配（保护堆上相邻分配）② 调用侧用栈上 `own_crc`
+    回填 `file_crc32`（栈变量越界够不着）——尺寸检查保留。诊断法见代码内注释
+18. **SD 卡写入物理锁卡**（P4 首测 2026-09-28）：读全程正常（TXT 分页、zip 流读、
+    字库 seek 都稳），但正式引脚 38/39/40 写临时文件 ~3KB 后驱动层报 0x109
+    （应答 CRC）→ 此后**读写全 0x107 超时**，`Storage::recover()`（CMD0 重挂）
+    也救不回，只能断电重插 = 卡写入期 VDD 塌陷/信号边际的典型症状（小文件
+    244/821B 写得过，持续写电流尖峰才顶不住；也不是 miniz 踩内存——全程
+    `heap ok`）。注意：2MB 写测速是**旧引脚 10/11/12**（现屏脚）的成绩，
+    正式引脚从来没验过写（§5.7 待补项）。→ 固件侧已根治：EPUB 临时文件
+    （container/OPF/xhtml/文本）全部改走**片内 LittleFS**（默认 16M 分区表的
+    spiffs 分区 3.5MB，`LittleFS.begin(true)` 首启自动格式化），全项目对 SD
+    零写入（进度在 NVS），EPUB 不再受卡写能力影响。硬件侧待办（做板 checklist
+    见 WIRING §4）：卡座 VDD 10µF+100nF 就近去耦、CMD/D0 实体 47k 上拉、
+    换卡排除、仍不稳则降频 10MHz；复测工具 `sdcard/one_bit_write`（已改 38/39/40）
+19. **串口 RX 幽灵命令 + drain 吞输入回归（2026-09-28）**：三个阶段——
+    ① 原始症状：EPUB 深睡唤醒后没发过 `b`，书被切走（日志反推 loop 首轮收到
+    'b' 又收到 'h'，均紧跟 `full refresh`）→ 疑似全刷串扰 RX0（GPIO44，UART0，
+    CDCOnBoot=Disabled）。
+    ② 加 `drainSerial()` 防护后引出**回归**：drain 在 `runRefresh` 尾执行，而
+    `handleSerial` 只在 loop 顶部跑一次 → **等待期（5s，用户输入主窗口）收到的
+    字节滞留到刷新结束被 drain 全吞**，实测 7 个 `b\n`（`62 0a`）全灭、`b` 切书
+    100% 失效。教训：**丢字节的防护必须放在字节到达的窗口内，不能放在下游**。
+    ③ 终态方案（三窗口各归各位）：等待期改**每 20ms 轮询** `handleSerial` 即时
+    执行（永不丢）；刷新期/开机期用 `harvestRx()` **收割验证**——恰好"一个命令
+    字符 + 换行"（终端实测发 `62 0a`）入队补执行，裸字节/乱码打 hex 记
+    `[rx] dropped`，纯换行（用户命令尾字节滞留）记 `[rx] ignore` 单独归档。
+    验证：`b` 即时执行、三次深睡恢复全部准确续页、深睡后无幽灵切书。
+    硬件侧仍待观察：RX 走线远离 SPI/屏升压、共地，接 USB-UART 小板时检查杜邦线
+    是否和屏线绞在一起；若再出现 `[rx] dropped` 含命令字符的随机字节即噪声实锤。
+20. **深睡自醒（待定案 2026-09-28）**：首次深睡后无故自醒（用户未开盖），后两次
+    正常开盖醒。日志事实：那次也是 `cause=3 (EXT1)`，即 **GPIO4 真实跳到开盖电平
+    才触发的唤醒**；且醒来后霍尔持续读"开盖"跨了两个翻页周期（约 19s）才重新
+    "合盖"入睡——瞬态串扰毛刺做不到这点，只剩两种解释：(a) 盖子/磁铁实际被碰到
+    （或合盖时磁铁就处于 DRV5032 阈值边际，静置后漂移出窗口）；(b) 传感器供电/
+    走线在深睡初期有慢恢复扰动。同轮唤醒还观察到 SD 首挂 0x107 重试 1-2 次成功
+    （坑 15 的唤醒版）。固件侧已加三路取证（下轮日志定案）：
+    ① `[wake] slept Ns` 入睡→唤醒实际时长（RTC 时钟跨深睡，`s_sleepAt`）——
+    **秒级 = 入睡瞬间毛刺/电平边际；分钟级 = 盖子真被打开过**
+    ② `[wake] ext1 pins=0x..` 触发脚位掩码（确认是 GPIO4 不是别的脚）
+    ③ `[wake] hall=N (closed/open)` pinMode 后立刻读——**EXT1 醒 + hall=closed
+    = 毛刺自醒实锤**（醒来时电平已回落）；EXT1 醒 + hall=open = 盖子确实开着
+    硬件侧排查（定案后再动手）：磁铁与 DRV5032 对位/气隙、合盖后轻敲看电平是否
+    跳、GPIO4 走线远离屏升压。
 
 ## 6. 本地工具
 - 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default /home/roba/Arduino/eink`

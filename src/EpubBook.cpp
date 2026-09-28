@@ -4,6 +4,7 @@
 #include "EinkPanel.h"
 #include "CjkFont.h"
 #include <ESP32epdx.h>
+#include <LittleFS.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -13,32 +14,31 @@
 
 using namespace tinyxml2;
 
-// ===== 临时诊断（P4 崩坏定位，定案后删）=====
-// 每阶段后做一次全堆完整性校验：poisoning 开着时，坏块头一写出来就能被抓到，
-// 比等 free 时 abort 早得多 —— 用来定位是哪个阶段踩了 PSRAM 堆。
-#include <esp_heap_caps.h>
-static void chk(const char* tag) {
-  bool ok = heap_caps_check_integrity_all(true);
-  Serial.printf("[heap %s] %s | psram free=%u heap free=%u\n",
-                ok ? "ok " : "BROKEN", tag,
-                (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
+// ---- EPUB 临时文件 FS：片内 LittleFS，绝不写 SD --------------------------------
+// 坑 18（DESIGN §5.18）：SD 卡写入 ~3KB 即驱动层物理锁死（0x109→读写全 0x107，
+// 只能断电重插），而 EPUB 全流程对 SD 只需要读（zip 流 + 字库 + TXT 书）。
+// 临时文件改走片内 Flash 的 LittleFS——默认 16M 分区表自带 3.5MB spiffs 分区，
+// 零配置改动；最大的 444KB 章节文本也远装得下。
+static fs::FS& tempFs() {
+  static bool ok = LittleFS.begin(true);   // 首启空分区自动格式化
+  if (!ok) Serial.println("WARN: LittleFS temp FS unavailable");
+  return LittleFS;
 }
-// ===== 诊断结束 =====
 
-// SD 临时文件（根目录，__ 前缀避免和书库扫描撞车）
+// EPUB 临时文件（LittleFS 根目录，__ 前缀避免和书库扫描撞车）
 static const char* TEMP_CONTAINER = "/__c.xml";
 static const char* TEMP_OPF       = "/__o.opf";
 static const char* TEMP_XHTML     = "/__e.xhtml";
 static const char* TEMP_TXT       = "/__e.txt";
 
-// ---- 文本汇：DOM 遍历 → SD 临时文本，顺手做空白规范化 ----
+// ---- 文本汇：DOM 遍历 → LittleFS 临时文本，顺手做空白规范化 ----
 // XHTML 源码里缩进/换行全是排版噪音；规则：折叠空白为单空格、块级元素补 '\n'、
 // 连续空行封顶 2（省页面行数）。UTF-8 多字节字节值都 ≥0x80，与 ASCII 空白判断无冲突。
-// 写出走 2KB 缓冲：逐字节 write 到 SD 会把 280KB 章节拖到几分钟，缓冲后一次刷盘。
+// 写出走 2KB 缓冲：逐字节 write 到 LittleFS 会把 280KB 章节拖到几分钟，缓冲后一次刷盘。
 class TextSink {
 public:
-  bool open(const char* path) {
-    m_f = SD_MMC.open(path, FILE_WRITE);
+  bool open(fs::FS& fs, const char* path) {
+    m_f = fs.open(path, FILE_WRITE);
     m_last = '\n'; m_nl = 1; m_len = 0; m_err = false;
     return (bool)m_f;
   }
@@ -148,12 +148,12 @@ static void sanitizeEntities(char* buf) {
   *w = '\0';
 }
 
-// ---- 兜底：XML 解析失败时的幼稚剥标签（从 SD 临时文件分块读，零大内存）----
+// ---- 兜底：XML 解析失败时的幼稚剥标签（从临时文件分块读，零大内存）----
 static bool naiveStripToText(const char* xhtmlPath, const char* txtPath) {
-  File in = SD_MMC.open(xhtmlPath, FILE_READ);
+  File in = tempFs().open(xhtmlPath, FILE_READ);
   if (!in) return false;
   TextSink sink;
-  if (!sink.open(txtPath)) { in.close(); return false; }
+  if (!sink.open(tempFs(), txtPath)) { in.close(); return false; }
   bool inTag = false;
   while (in.available()) {
     char c = (char)in.read();
@@ -164,12 +164,12 @@ static bool naiveStripToText(const char* xhtmlPath, const char* txtPath) {
   }
   in.close();
   sink.close();
-  return !sink.err();          // 兜底路径也看写结果（SD 停摆时别当成功章）
+  return !sink.err();          // 兜底路径也看写结果（写停摆时别当成功章）
 }
 
-// 读整个 SD 文件进 PSRAM（+1 给 '\0'）。失败返回 nullptr。
-static char* readFileToPsram(const char* path, size_t* outLen) {
-  File f = SD_MMC.open(path, FILE_READ);
+// 读整个临时文件进 PSRAM（+1 给 '\0'）。失败返回 nullptr。
+static char* readFileToPsram(fs::FS& fs, const char* path, size_t* outLen) {
+  File f = fs.open(path, FILE_READ);
   if (!f) return nullptr;
   size_t n = f.size();
   char* buf = (char*)ps_malloc(n + 1);
@@ -213,12 +213,10 @@ bool EpubBook::open(const char* path) {
   m_sdDead = false;                               // 新一轮书会话，给 SD 重新判活机会
 
   if (!m_zip.open(path)) { s_openPath[0] = '\0'; return false; }
-  chk("zip.open");
 
   // 1) container.xml → rootfile(OPF) 路径
   if (!extractWithRecovery("META-INF/container.xml", TEMP_CONTAINER)) { m_zip.close(); return false; }
-  chk("container.extract");
-  char* cbuf = readFileToPsram(TEMP_CONTAINER, NULL);
+  char* cbuf = readFileToPsram(tempFs(), TEMP_CONTAINER, NULL);
   if (!cbuf) { m_zip.close(); return false; }
   const char* opfPath = NULL;
   XMLDocument cdoc;
@@ -245,8 +243,7 @@ bool EpubBook::open(const char* path) {
   char opf[64];
   snprintf(opf, sizeof(opf), "%s", opfPath ? opfPath : "");
   free(cbuf);
-  SD_MMC.remove(TEMP_CONTAINER);
-  chk("container.parse");
+  tempFs().remove(TEMP_CONTAINER);
   if (!opf[0]) { Serial.println("WARN: container.xml: no rootfile"); m_zip.close(); return false; }
 
   // 2) OPF 所在目录（href 拼接用）
@@ -259,7 +256,6 @@ bool EpubBook::open(const char* path) {
 
   // 3) OPF：标题 + manifest + spine
   if (!parseOpf(opf)) { m_zip.close(); s_openPath[0] = '\0'; return false; }
-  chk("opf.parse");
   if (!m_nChapters) {
     Serial.println("WARN: EPUB spine has no xhtml chapters");
     m_zip.close(); s_openPath[0] = '\0'; return false;
@@ -285,18 +281,20 @@ void EpubBook::close() {
   m_ok = false;
 }
 
-// ---- 解压 + SD 写失败自救 --------------------------------------------------
-// P4 首测（2026-09-28）：EPUB 解压的 SD 写在驱动层停摆 —— 0x107 命令超时 /
-// 0x109 应答 CRC 后卡不再应答，之后每次写固定 ≈5s 超时；而**读全程正常**、
-// 全堆完整性每步都过 → 不是 miniz 越界踩内存，是卡/写路径在驱动层挂了。
-// 三步走，日志带耗时（下一轮串口日志即可定案）：
+// ---- 解压 + SD 失败自救 --------------------------------------------------
+// P4 首测（2026-09-28）定案：EPUB 解压的 SD **写**在驱动层停摆 —— 0x107 命令
+// 超时 / 0x109 应答 CRC 后卡不再应答，之后每次写固定 ≈5s 超时；而**读全程
+// 正常**、全堆完整性每步都过 → 不是 miniz 越界踩内存，是卡/写路径物理挂死
+// （只能断电重插，CMD0 重挂救不回）。→ 坑 18：临时文件全部改走片内 LittleFS，
+// 本项目对 SD 零写入。
+// 本函数保留作 SD **读**（zip 流/字库/TXT 书）出错时的自救，三步走：
 //   ① 读探针：连读都死 = 卡彻底挂死 → 只能断电重插，立即放弃（防连环 5s 超时）
 //   ② 关全部 SD 句柄 → Storage::recover()（end+begin，卡走 CMD0 重新初始化）
 //   ③ 重开 zip 重试解压：成功 = 重挂救得回（固件可自救）；失败 = SD 不可用
 bool EpubBook::extractWithRecovery(const char* zipPath, const char* outPath) {
-  if (m_sdDead) return false;               // 本会话已判死：跳过一切 SD 写
+  if (m_sdDead) return false;               // 本会话已判死：不再探 SD（防连环超时）
 
-  if (m_zip.extractToFile(zipPath, outPath)) return true;
+  if (m_zip.extractToFile(zipPath, outPath, tempFs())) return true;
   if (m_zip.lastFail() != EpubZip::EXFAIL_IO) return false;   // 条目缺/校验败：与 SD 无关
 
   uint32_t t0 = millis();
@@ -334,8 +332,8 @@ bool EpubBook::extractWithRecovery(const char* zipPath, const char* outPath) {
     return false;
   }
 
-  // ③ 重挂后重试（这次的写就是写探针）
-  if (m_zip.extractToFile(zipPath, outPath)) {
+  // ③ 重挂后重试（miniz 重新流读 zip 即读探针；写目标是 LittleFS 不受 SD 影响）
+  if (m_zip.extractToFile(zipPath, outPath, tempFs())) {
     Serial.printf("[sdtriage] extract OK after remount - recovered (%lu ms total)\n",
                   (unsigned long)(millis() - t0));
     return true;
@@ -348,8 +346,8 @@ bool EpubBook::extractWithRecovery(const char* zipPath, const char* outPath) {
 // 解析 OPF：dc:title（可无）、manifest(id→href/type)、spine(idref 序列）
 bool EpubBook::parseOpf(const char* opfPath) {
   if (!extractWithRecovery(opfPath, TEMP_OPF)) return false;
-  char* buf = readFileToPsram(TEMP_OPF, NULL);
-  SD_MMC.remove(TEMP_OPF);
+  char* buf = readFileToPsram(tempFs(), TEMP_OPF, NULL);
+  tempFs().remove(TEMP_OPF);
   if (!buf) return false;
 
   XMLDocument doc;
@@ -417,12 +415,12 @@ bool EpubBook::parseOpf(const char* opfPath) {
 
 // XHTML 临时文件 → 纯文本临时文件（tinyxml2 为主，剥标签兜底）
 bool EpubBook::convertChapterToText() {
-  File xf = SD_MMC.open(TEMP_XHTML, FILE_READ);
+  File xf = tempFs().open(TEMP_XHTML, FILE_READ);
   if (!xf) return false;
   size_t xsize = xf.size();
   xf.close();
 
-  char* buf = readFileToPsram(TEMP_XHTML, NULL);
+  char* buf = readFileToPsram(tempFs(), TEMP_XHTML, NULL);
   if (!buf) {
     Serial.println("WARN: chapter too big for RAM - naive strip fallback");
     return naiveStripToText(TEMP_XHTML, TEMP_TXT);
@@ -439,10 +437,10 @@ bool EpubBook::convertChapterToText() {
     XMLDocument doc;                    // 析构在作用域尾：池块（PSRAM）随释放
     if (doc.Parse(start) == XML_SUCCESS) {
       TextSink sink;
-      if (sink.open(TEMP_TXT)) {
+      if (sink.open(tempFs(), TEMP_TXT)) {
         collectText(&doc, sink, false);
         sink.close();
-        ok = !sink.err();          // SD 写停摆 → 文本不完整 → 判坏章
+        ok = !sink.err();          // 临时文件写停摆 → 文本不完整 → 判坏章
         if (!ok) Serial.println("WARN: chapter text write failed");
       }
     } else {
@@ -451,10 +449,9 @@ bool EpubBook::convertChapterToText() {
     }
   }
   free(buf);
-  chk("xml.parse+sink");
   if (!ok) return naiveStripToText(TEMP_XHTML, TEMP_TXT);
 
-  File tf = SD_MMC.open(TEMP_TXT, FILE_READ);
+  File tf = tempFs().open(TEMP_TXT, FILE_READ);
   size_t tsize = tf ? tf.size() : 0;
   if (tf) tf.close();
   Serial.printf("[epub] chapter %u: xhtml %uB -> text %uB, %lu ms | psram free=%u\n",
@@ -466,18 +463,16 @@ bool EpubBook::convertChapterToText() {
 // 解压一章 + 转文本 + 交给 TxtBook。false = 本章坏（调用方跳过）
 bool EpubBook::loadChapter(uint16_t idx) {
   if (idx >= m_nChapters) return false;
-  Serial.printf("[dbg] loadChapter(%u) enter\n", (unsigned)idx);
+  m_txt.close();   // 先关旧句柄：TextSink 马上以 FILE_WRITE 截断重写同一临时文件，
+                   // 两处同开一个文件不干净；转换失败时旧章文本也别留在渲染路径上
   extractWithRecovery(m_chapterPath[idx], TEMP_XHTML) ||
       Serial.printf("WARN: extract failed: %s\n", m_chapterPath[idx]);
-  chk("extract");
   bool ok = convertChapterToText();
-  chk("convert");
-  SD_MMC.remove(TEMP_XHTML);
+  tempFs().remove(TEMP_XHTML);
   if (!ok) return false;
 
-  if (!m_txt.open(TEMP_TXT)) return false;
-  chk("txt.open");
-  m_txt.setQuiet(true);            // 章节切换频繁，头部 dump 会刷屏
+  m_txt.setQuiet(true);            // 章节切换频繁，头部 dump 会刷屏（须在 open 前）
+  if (!m_txt.open(tempFs(), TEMP_TXT)) return false;
   m_txt.setLoop(false);            // 章末停住，由本类推进下一章
   m_txt.setTier(m_tier);
   m_txt.setFamily(m_family);
@@ -542,7 +537,6 @@ bool EpubBook::renderPair(uint8_t* fbL, uint8_t* fbR) {
     if (m_txt.hitEof()) m_chapterDone = true;
   }
   m_page += 2;
-  chk("render");
   return true;
 }
 
