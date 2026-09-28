@@ -450,13 +450,15 @@ static void verdict() {
     Serial.println("   → 软件缓解：SD 写入一律 ≤512B 分块（实测 0.25MB/s 不损失）+ 每块查返回值。");
     Serial.println("   → 根因未变：卡写能力/供电边际（换卡排除 + 卡座 VDD 去耦，见 WIRING §4）。");
   } else if (a.saw0x109 || b.saw0x109) {
-    Serial.println("  出现过 0x109 CRC = DESIGN 坑 18 指纹 → 换卡排除 + 卡座去耦，断电重插再测。");
+    Serial.println("  出现 0x109 应答 CRC（坑 18 之一，充分非必要）→ 换卡排除 + 卡座去耦，断电重插再测。");
   } else if (a.pacedRan && a.pacedOk) {
     Serial.println("  连续写挂、节流写过 = 供电塌陷/卡内部编程时间不够（坑 18 方向）→ 卡座 VDD 去耦优先，其次换卡。");
   } else if (b.mounted && a.writeFail && b.writeFail) {
     Serial.println("  降频 10MHz 无改善 = 排除 20MHz 信号完整性 → 剩两个嫌疑：卡座供电去耦、卡本身；换卡最快定案。");
   } else {
-    Serial.println("  写路径仍挂 → 按上面打印的驱动层码继续查（0x107=信号/上拉/供电，0x109=CRC/去耦）。");
+    Serial.println("  写路径仍挂（纯 0x107 数据相超时：卡收下命令却不肯放 BUSY = 卡没完成编程，不是 CRC）。");
+    Serial.println("   → 0x109 不是必要条件：09-28 NetSvc 真实上传 512B 分块挂 @29696 字节时就只有 0x107。");
+    Serial.println("   → 方向：换卡排除 + 卡座 VDD 去耦 + CMD/D0 47k 上拉（WIRING §4）。");
   }
 }
 
