@@ -1,0 +1,15 @@
+# 自定义 16MB 分区表（sketch 根目录 partitions.csv 会自动覆盖菜单选择，
+# platform.txt prebuild hook：source > variant > build.partitions）。
+# 布局 = app3M_fat9M_16MB，仅把 ffat 改名 spiffs：
+#   LittleFS.begin()（src/EpubBook.cpp）默认按 label="spiffs" 找分区，
+#   用菜单原版 app3M_fat9M_16MB（ffat）会挂载失败 → EPUB 临时文件全废。
+# 菜单仍选 PartitionScheme=app3M_fat9M_16MB（借它 upload.maximum_size=3MB 做编译上限检查）。
+# nvs/otadata 与 default 完全同址同大小（0x9000/0x5000）→ 换表后书进度/WiFi/字体设置不丢；
+# spiffs 换址 → LittleFS.begin(true) 首启自动格式化（临时文件本来就是易失的）。
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x300000,
+app1,     app,  ota_1,   0x310000,0x300000,
+spiffs,   data, spiffs,  0x610000,0x9E0000,
+coredump, data, coredump,0xFF0000,0x10000,

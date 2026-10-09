@@ -24,7 +24,10 @@ SD 卡（SDMMC 1-bit，4-bit 实测不稳，见 §5.7）：
 > P3 实测教训（2026-09-24）：SD CMD 误接 GPIO29 → `sdmmc_init_ocr` 0x107
 > （卡无应答）。26-32 是 N16R8 内部 Flash 引脚，硬件占死，任何外设都不能用。
 
-编译 FQBN：`esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default`
+编译 FQBN：`esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB`
+> 分区表实际以 sketch 根目录 **`partitions.csv`** 为准（platform.txt prebuild 钩子
+> source > variant > build.partitions 自动覆盖菜单项）——菜单选 `app3M_fat9M_16MB`
+> 只为借它的 `upload.maximum_size=3MB` 做体积上限检查。详见坑 22。
 
 ### 1.2 经典 ESP32 Dev Module（❌ 已废弃 —— 代码不再支持，仅存档）
 > P3 起 sketch 只面向 ESP32-S3（`CONFIG_IDF_TARGET_ESP32S3` 分支已删）。
@@ -314,8 +317,8 @@ bug 已修（坑 21）→ 复烧回归通过）**：
     244/821B 写得过，持续写电流尖峰才顶不住；也不是 miniz 踩内存——全程
     `heap ok`）。注意：2MB 写测速是**旧引脚 10/11/12**（现屏脚）的成绩，
     正式引脚从来没验过写（§5.7 待补项）。→ 固件侧已根治：EPUB 临时文件
-    （container/OPF/xhtml/文本）全部改走**片内 LittleFS**（默认 16M 分区表的
-    spiffs 分区 3.5MB，`LittleFS.begin(true)` 首启自动格式化），**EPUB/渲染路径对 SD
+    （container/OPF/xhtml/文本）全部改走**片内 LittleFS**（根目录 `partitions.csv`
+    定制的 spiffs 分区 9.9MB，`LittleFS.begin(true)` 首启自动格式化，见坑 22），**EPUB/渲染路径对 SD
     零写入**（进度在 NVS），EPUB 不再受卡写能力影响；唯一的 SD 写点是网页上传
     `/books`，已按坑 18 改 512B 单块写（见第 7 条"固件已落地"）。硬件侧待办（做板 checklist
     见 WIRING §4）：卡座 VDD 10µF+100nF 就近去耦、CMD/D0 实体 47k 上拉、
@@ -414,8 +417,28 @@ bug 已修（坑 21）→ 复烧回归通过）**：
     **排查口诀**：屏上图"糊"先怀疑采样/索引（步进、坐标映射），别急着怪分辨率；
     `CORRUPT HEAP ... Bad tail` = 精确越界 2~8 字节，先查行缓冲按宽度分配的地方。
 
+22. **分区表选错 = EPUB 静默全废（2026-10-10 定案）**：`LittleFS.begin()`
+    （src/EpubBook.cpp）不传 label 时**默认按 `spiffs` 找分区**；而 esp32s3 板型
+    （core 2.0.17 boards.txt）菜单里带 16MB 数据区的两项 `fatflash`/`app3M_fat9M_16MB`
+    数据区都叫 **`ffat`（FAT）**，数据区叫 `spiffs` 的项又全是 4MB/8MB 表——**没有
+    "16MB + spiffs" 的菜单项**（`default_16MB.csv` 文件在 tools/partitions 里有，
+    但 esp32s3 菜单不提供）。选错的症状：编译烧录全过，运行时 `begin()` 找不到
+    分区 → EPUB 解压临时文件写不进 → **只有 EPUB 坏、TXT/SD 正常**，极难察觉。
+    （2026-10-09 就抓到两份错构：项目缓存按 `app3M_fat9M_16MB`（ffat）编的，
+    另一份按 `FlashSize=4M` 编的。）
+    → **定案**：sketch 根目录放 **`partitions.csv`**（platform.txt prebuild 钩子
+    自动覆盖菜单，优先级 source > variant > build.partitions，arduino-cli 和
+    Arduino IDE 编译都生效）。表 = `app3M_fat9M_16MB` 布局、仅 `ffat`→`spiffs`：
+    app0/app1 各 3MB（OTA 双槽保留），spiffs 9.9MB @0x610000，coredump 64KB；
+    nvs/otadata 与 `default` 完全同址同大小（0x9000/0x5000）→ **换表后书进度/
+    WiFi/字体设置不丢**；spiffs 换址 → `LittleFS.begin(true)` 首启自动格式化
+    （临时文件本就易失）。菜单 FQBN 仍写 `PartitionScheme=app3M_fat9M_16MB`——
+    只为借它的 `upload.maximum_size=3145728` 做编译体积检查（现 997KB/3MB 32%，
+    default 表下已 75% 快顶）。验证：解码构建缓存 `eink.ino.partitions.bin`
+    确认 `spiffs @0x610000/10112K`。
+
 ## 6. 本地工具
-- 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default /home/roba/Arduino/eink`
+- 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB '/home/roba/Nutstore Files/我的坚果云/Projects/Personal/eink'`
 - 竖版页离屏回归（不接硬件，§3.7）：`GUI=$HOME/Arduino/libraries/ESP32epdx/src/GUI g++ -std=c++17 -I"$GUI" tools/rot_layout_test.cpp "$GUI/GUI_Paint.cpp" "$GUI/font16.cpp" -o /tmp/rot_layout_test && /tmp/rot_layout_test`
   （断言逻辑画布 480×648、最坏排版零越界、页顶朝右；改动排版常量后跑一下）
 - 字库生成：`python3 tools/mk_unifont.py`（源 `unifont_all.hex` → `assets/fonts/unifont.bin`，已生成）
@@ -432,7 +455,7 @@ bug 已修（坑 21）→ 复烧回归通过）**：
     `font-<名字>-<16|24|32>.bin`（字体家族，缺某档自动回 classic）
   - `/books/`：电子书 `*.txt` **和 `*.epub`**（P4 起书库扫描两类，串口 `b` 切换）
   → 缺 `unifont.bin` 时汉字全画 16×16 空心框
-- 霍尔深睡台架测试：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default /home/roba/Arduino/eink/hall_sleep_test`
+- 霍尔深睡台架测试：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB '/home/roba/Nutstore Files/我的坚果云/Projects/Personal/eink/hall_sleep_test'`
   （合盖 300ms 深睡 / EXT1 开盖唤醒 / RGB 48 可视判定；极性反了改 `HALL_CLOSED_LEVEL`）
 - 资料：`~/Downloads/Gdey0583T81/`（屏规格书 + UC8179 数据手册 + 官方 demo 压缩包）
 
@@ -516,7 +539,8 @@ SoftAP 配网页；OTA 开关同时管 ArduinoOTA（arduino-cli 网络上传）�
 - NVS 独立命名空间 `eink-net`（`wifi`/`ota`/`up`/`ssid`/`pass`），与书进度的
   `eink-book` 不混；WiFi 驱动自身 NVS 关掉（`WiFi.persistent(false)`）防闪存磨损。
 
-**验收**：编译通过（989KB/1.25MB app 分区 75%，OTA app1 够用；
+**验收**：编译通过（989KB——当时 default 表 1.25MB app 分区 75%；换根目录
+`partitions.csv` 3MB 表后 997KB/3MB 仅 32%，见坑 22；OTA app1 够用；
 heap 余 244KB，WiFi 栈 ~45KB 无压力）。**硬件实测待做**：热点配网全流程、
 上传进书库、arduino-cli 网络上传、开 WiFi 后双屏同刷不重启（§2 电流预案：
 若重启 → AMS1117 单独喂屏）。
