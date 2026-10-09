@@ -5,7 +5,8 @@
 
 // === 参数（key_test 台架 2026-10-08 实测，见 src/Keys.h 头注）===
 static const uint32_t DEBOUNCE_US = 20000;    // 20ms 去抖
-static const uint32_t LONG_US = 600000;       // 600ms 长按（实测按住 115–800ms）
+static const uint32_t LONG_US = 250000;       // 250ms 长按（WIRING §3.4 台架定标：
+                                              // 实测按住 115–800ms，阈值取 ~250ms）
 static const uint32_t REPEAT_US = 300000;     // 长按后每 300ms 连发
 static const int EDGE_N = 16;                 // 边沿环长（2 的幂）
 static const int EV_N = 8;                    // 事件队列长
@@ -120,7 +121,26 @@ void Keys::poll() {
   // ② 长按到点 / 长按后连发（poll 不跑期间暂停，恢复后按 now 顺延一拍，
   //    不做欠账补发 —— 避免刷新结束瞬间连打一串翻页）
   for (uint8_t i = 0; i < COUNT; i++) {
-    if (!m_down[i]) continue;
+    if (!m_down[i]) { m_highSince[i] = 0; continue; }
+
+    // 电平兜底（见头注）：m_down 与引脚实际电平背离满一个去抖窗 → 补发释放
+    if (gpio_get_level((gpio_num_t)s_pins[i]) != 0) {
+      if (!m_highSince[i]) { m_highSince[i] = now; continue; }
+      if ((uint32_t)(now - m_highSince[i]) < DEBOUNCE_US) continue;
+      m_down[i] = false;
+      m_highSince[i] = 0;
+      bool lf = m_longFired[i];
+      // 与松开沿同款的补判：整段按住落在刷新窗口里、LONG 没来得及发
+      if (m_armed[i] && !lf && (uint32_t)(now - m_pressUs[i]) >= LONG_US) {
+        m_longFired[i] = lf = true;
+        pushEv(i, LONG, true);
+      }
+      if (m_armed[i]) pushEv(i, RELEASE, lf);
+      m_armed[i] = false;
+      continue;
+    }
+    m_highSince[i] = 0;
+
     if (!m_longFired[i]) {
       if ((int32_t)(now - m_pressUs[i]) >= (int32_t)LONG_US) {
         m_longFired[i] = true;

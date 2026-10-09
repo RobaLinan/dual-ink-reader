@@ -14,8 +14,11 @@
 //
 // 判定参数（key_test 台架实测 2026-10-08：按键 4×10 次 bnc=0，按住 115–800ms）：
 //   去抖 20ms：相邻边沿 <20ms 视作触点抖动丢弃（计入 bounce）
-//   长按 600ms：到点发 LONG；到点前松开发 RELEASE(longFired=false)=短按
+//   长按 250ms：到点发 LONG；到点前松开发 RELEASE(longFired=false)=短按
 //   连发 300ms：仅 PREV/NEXT（长按翻页连发；菜单内 = 上下滚动）
+//   电平兜底：按下沿被误采纳后不会再有真实边沿（如 >20ms 的松开抖动沿），
+//     m_down 会卡死 → 幽灵 LONG/REPEAT 无限翻页；引脚连续读高满一个去抖窗
+//     则补发释放（自身也走 20ms 确认，不把按住中的正常回读误判成松开）
 //   醒后/开机时已被按住的键：不补发按下（释放时 down=false 直接吞掉）
 //   —— 深睡中按过的键不产生幽灵事件（DESIGN §4 P6 进行中）
 class Keys {
@@ -56,6 +59,7 @@ private:
 
   // poll 侧（单写者）
   uint32_t m_lastAccept[COUNT] = {0};   // 上一条被采纳的边沿时刻（去抖基准）
+  uint32_t m_highSince[COUNT] = {0};    // 电平兜底：m_down 但引脚读高的起始时刻
   uint32_t m_pressUs[COUNT] = {0};      // 本次按下的时刻
   uint32_t m_nextRepeatUs[COUNT] = {0}; // 下一次连发时刻
   bool m_down[COUNT] = {false};         // 稳定按下状态

@@ -23,10 +23,17 @@
 // 菜单开着暂停自动翻页，合盖仍深睡（开盖回书页，菜单不跨睡）。
 //
 // P6 板载 4 键（src/Keys.h，GPIO1/2/9/10，电气台架 key_test 已过 2026-10-08）：
-//   Prev/Next = 上/下一对页（长按 600ms 后 300ms 连发，历史栈 48 对页可回退）、
-//   Menu = 开/关系统菜单、Font 短按 = 字号 / 长按 = 字体家族；
+//   Prev/Next = 上/下一对页（长按 250ms 后 300ms 连发，历史栈 48 对页可回退）、
+//   Menu 短按 = **主页（选书）** / 长按 250ms = 系统菜单、
+//   Font 短按 = 字号 / 长按 = 字体家族；
 //   自动翻页**默认关**（真实阅读不自翻，串口 a 开 = 台架测试）。
 //   按键不参与深睡唤醒（唤醒只有霍尔 EXT1，2026-10-08 定案）。
+//
+// 主页（P7，src/HomePage.*）：左页书库列表（选中 '>' + [在读] 标记），右页
+// 正在读/书库统计/按键说明；Font 短按 = 打开选中书（选中当前读的那本 = 只回
+// 阅读页）；主页里 Prev/Next 上下选。串口同款：n 进出主页、j/k 选、空格打开。
+// 与系统菜单分层：菜单 = 设置（WiFi/OTA/上传），主页 = 选书；退出菜单按来源
+// 回主页或书页。合盖深睡记住"睡前屏上是主页还是书页"，开盖原样恢复。
 
 #include <ESP32epdx.h>
 #include <Preferences.h>
@@ -43,6 +50,7 @@
 #include "src/Storage.h"
 #include "src/NetSvc.h"
 #include "src/SysMenu.h"
+#include "src/HomePage.h"
 #include "src/Keys.h"
 #include <SD_MMC.h>
 
@@ -83,6 +91,8 @@ RTC_DATA_ATTR time_t s_sleepAt = 0;          // 入睡 wall-clock：醒后打印
                                              // "分钟级=盖子真被打开过"）
 RTC_DATA_ATTR bool s_sleepMenu = false;      // 入睡时菜单还开着：屏上是菜单不是书页，
                                              // 开盖跳过零闪烁恢复、走全刷回书页
+RTC_DATA_ATTR bool s_sleepHome = false;      // 入睡时主页开着：屏上是选书页 → 开盖
+                                             // 走全刷回主页（书的进度已按 NVS 恢复）
 
 static const uint32_t FULL_EVERY = 5;        // 每 5 次快刷插 1 次全刷
 static const uint32_t PAGE_INTERVAL_MS = 5000;
@@ -92,6 +102,11 @@ static const uint32_t SAVE_EVERY_PAIRS = 10; // 进度落盘频率（对页数�
 // P6（2026-10-08 定案）：自动翻页**默认关** —— 有按键后真实阅读不能自翻；
 // 台架测试（P5 50 页/P2 100 次连刷/电量）用串口 a 临时打开
 static bool g_autoFlip = false;
+
+// 主页（P7 选书页）激活中：屏上是主页而非书页 → 跳过自动翻页、Prev/Next 改为
+// 选书、Menu 短按已在主页时不动。系统菜单与主页可叠（菜单优先分发），
+// 退出菜单按 g_home 回主页或书页
+static bool g_home = false;
 
 // P6 上一页的历史栈（函数见 setup 前的"按键翻页"块）：开机恢复点之前的页
 // 不可回退 → 换书/开书即清零（见 openBook）
@@ -168,7 +183,7 @@ static uint8_t g_size = TXT_SIZE_PX;   // 当前字号档（16/24/32）
 static int g_fam = 0;                  // 当前家族（0=classic）
 
 static void printFontState() {
-  Serial.printf("[font] family=%s size=%u book=%s (serial: f=font s=size b=next book m=menu a=auto h=status)\n",
+  Serial.printf("[font] family=%s size=%u book=%s (serial: f=font s=size b=next book n=home m=menu a=auto h=status)\n",
                 CJK.familyName(g_fam), g_size,
                 s_libIdx >= 0 ? s_lib[s_libIdx].path : "-");
 }
@@ -269,21 +284,105 @@ static void runRefresh(bool fullMode) {
   harvestRx(fullMode ? "full refresh" : "fast refresh");
 }
 
-// 一次菜单刷新（内容 = menu.draw 进 draw 缓冲，其余节奏与 runRefresh 相同）。
-// fullMode：开菜单用全刷清残影；导航/动作用快刷（DTM1 = 屏上真实的菜单帧）
-static void showMenuRefresh(bool fullMode) {
-  menu.draw(fbDrawL, fbDrawR, s_nlib);
-
+// 一轮刷新的通用节奏：计时统计 → 灌帧刷新 → 双缓冲换挡 → 收割 RX。
+// 前提：内容已画进 fbDrawL/fbDrawR。tag 记日志（"menu"/"home"…），
+// tag 同时是收割窗口的 why —— 刷新期 SPI 灌帧会灌进假命令字节（见 runRefresh）
+static void presentDraw(bool fullMode, const char* tag) {
   uint32_t t0 = millis();
   bool ok = refreshPair(fullMode ? EinkPanel::FULL : EinkPanel::FAST);
   uint32_t dt = millis() - t0;
 
   stats.add(fullMode, dt, ok);
-  Serial.printf("menu %s refresh: %lu ms (%s)\n",
+  Serial.printf("%s %s refresh: %lu ms (%s)\n", tag,
                 fullMode ? "full" : "fast", (unsigned long)dt,
                 ok ? "ok" : "TIMEOUT");
   swapPair();
-  harvestRx("menu refresh");
+
+  char why[32];
+  snprintf(why, sizeof(why), "%s refresh", tag);
+  harvestRx(why);
+}
+
+// 一次菜单刷新（内容 = menu.draw 进 draw 缓冲）。
+// fullMode：开菜单用全刷清残影；导航/动作用快刷（DTM1 = 屏上真实的菜单帧）
+static void showMenuRefresh(bool fullMode) {
+  menu.draw(fbDrawL, fbDrawR, s_nlib);
+  presentDraw(fullMode, "menu");
+}
+
+// ===== 主页（P7 选书页，src/HomePage.*）==============================
+// 拼书库上下文 → home.draw 进 draw 缓冲 → 刷一轮。
+// 打开主页用全刷（书页 → 主页整屏换内容，清残影）；选书/滚动用快刷
+static void drawHomeRefresh(bool fullMode) {
+  const char* paths[sizeof(s_lib) / sizeof(s_lib[0])];
+  for (int i = 0; i < s_nlib; i++) paths[i] = s_lib[i].path;
+  char fontInfo[40];
+  snprintf(fontInfo, sizeof(fontInfo), "%s %upx", CJK.familyName(g_fam), g_size);
+
+  HomePage::Ctx ctx;
+  ctx.paths = paths;
+  ctx.count = s_nlib;
+  ctx.curIdx = s_libIdx;
+  ctx.curPage = (bookOk && book) ? (long)book->pairPageNo() : -1L;
+  ctx.fontInfo = fontInfo;
+
+  home.draw(fbDrawL, fbDrawR, ctx);
+  presentDraw(fullMode, "home");
+}
+
+// 系统菜单入口（Menu 长按 / 串口 m）：全刷清上一帧残影。
+// 主页开着时 g_home 不清 —— 退出菜单（applyMenuResult CLOSE）据此回主页
+static void openSysMenu() {
+  if (menu.isOpen()) return;
+  menu.open();
+  showMenuRefresh(true);
+}
+
+// 主页入口（Menu 短按 / 串口 n）：选中项落到正在读的那本
+static void openHome() {
+  if (g_home || menu.isOpen()) return;
+  home.open(s_libIdx, s_nlib);
+  g_home = true;
+  drawHomeRefresh(true);                 // 全刷：整屏换内容
+}
+
+// 回阅读页：restartPair 把当前对页重画进 draw 缓冲（不推进页码），
+// 失败（demo 页/首渲染前）自然走下一对页 —— 与菜单退出同一条路径
+static void closeHome() {
+  if (!g_home) return;
+  g_home = false;
+  home.close();                  // m_open 同步收掉（PICK 路径不经过 home.key 的
+                                 // 自闭分支，不收会留下 isOpen()=true 的悬置态）
+  if (bookOk && book) book->restartPair();
+  runRefresh(false);
+}
+
+// 打开选中书。选中正在读的那本 = 只回阅读页（进度原地不动，不重开）；
+// 换书 = 关旧开新、从第 0 对页起（单槽进度存档随后被新书覆盖，同串口 b）
+static void pickBook(int idx) {
+  if (idx == s_libIdx && bookOk && book) { closeHome(); return; }
+  if (idx < 0 || idx >= s_nlib) { closeHome(); return; }
+
+  saveProgress();
+  if (!openBook(idx)) {
+    Serial.println("WARN: home pick open failed - keeping demo");
+    bookOk = false;
+    closeHome();
+    return;
+  }
+  bookOk = true;
+  prefs.remove("pos"); prefs.remove("page"); prefs.remove("ch");
+  saveProgress();
+  printFontState();
+  g_home = false;
+  runRefresh(true);                      // 全刷进新书第 0 对页
+}
+
+// 主页按键结果 → 刷屏节奏（与 applyMenuResult 对称）
+static void applyHomeResult(HomePage::Result r) {
+  if (r == HomePage::REDRAW) drawHomeRefresh(false);   // 上下选：快刷
+  else if (r == HomePage::CLOSE) closeHome();
+  else if (r == HomePage::PICK) pickBook(home.selected());
 }
 
 // 网页上传完成（NetSvc 回调，loop 上下文）：重扫书库。
@@ -311,8 +410,9 @@ static void onBookAdded(const char* path) {
     for (int i = 0; i < s_nlib; i++)
       if (!strcmp(cur, s_lib[i].path)) { s_libIdx = i; break; }
   }
-  // 菜单开着：右页"书库: N 本"要跟着变 → 重画（否则屏上状态过期）
+  // 菜单/主页开着：右页"书库: N 本"、左页列表都可能过期 → 重画
   if (menu.isOpen()) showMenuRefresh(false);
+  else if (g_home) drawHomeRefresh(false);
 }
 
 // ===== P6 按键翻页：对页历史栈 + 统一刷新节奏 ==========================
@@ -407,6 +507,9 @@ void setup() {
   // 无条件清零：这标志只在入睡瞬间写一次
   bool sleptWithMenu = s_sleepMenu;
   s_sleepMenu = false;
+  // 同上：睡前屏上是主页（选书页）→ 本醒不能走零闪烁恢复，落全刷回主页
+  bool sleptWithHome = s_sleepHome;
+  s_sleepHome = false;
 
   // 唤醒原因（开盖恢复路径的判定依据；非 EXT1 = 走冷启动 NVS 恢复，会全刷
   // 一次屏。上次唤醒日志里没有 [wake] EXT1 行、cause 未知 → 每次开机都打）
@@ -521,7 +624,10 @@ void setup() {
   bool resumed = false;
   if (sleptWithMenu)
     Serial.println("[wake] slept with menu open - full refresh back to book page");
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 && !sleptWithMenu) {
+  if (sleptWithHome)
+    Serial.println("[wake] slept on home page - full refresh back to home");
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 &&
+      !sleptWithMenu && !sleptWithHome) {
     Serial.println("[wake] EXT1 (lid opened) - resuming book");
     bool restored = false;
     if (s_sleepFilePos >= 0)
@@ -544,7 +650,17 @@ void setup() {
     if (pos >= 0) restored = restoreAt(pos, pg, ch);
     if (!restored) book->restartPair();   // 无有效存档：从第 0 对页开始
   }
-  if (!resumed) runRefresh(true);
+  if (!resumed) {
+    if (sleptWithHome) {
+      // 睡前在主页：进度已在上面按 NVS 恢复（选中当前书即可接着读），
+      // 屏上重画主页（全刷 —— fbShown 是白的，不能走零闪烁）
+      home.open(s_libIdx, s_nlib);
+      g_home = true;
+      drawHomeRefresh(true);
+    } else {
+      runRefresh(true);
+    }
+  }
   // setup 期间（面板初始化/章节解压/全刷升压）攒下的 RX 字节过一遍账再进 loop：
   // 收割验证 —— 用户开机电前抢发的完整命令（"b\n"）入队补执行，裸字节当噪声丢弃
   // （P4 幽灵 'b'/'h' 实际就在这个窗口入栈）
@@ -562,6 +678,7 @@ static bool hallClosing() {
 // 合盖 → 存对页位置 → SPI 引脚 hold → EXT1(开盖) 深睡。不返回
 static void enterDeepSleep() {
   s_sleepMenu = menu.isOpen();   // 屏上是菜单帧 → 记账，开盖走全刷回书页
+  s_sleepHome = g_home;          // 屏上是主页帧 → 记账，开盖走全刷回主页
   net.beforeSleep();             // 停 WebServer/OTA、关 WiFi 射频（深睡不带电）
   saveProgress();
   s_sleepFilePos = bookOk ? book->pairFilePos() : -1;
@@ -614,7 +731,8 @@ static void nextBook() {
 
 // ===== 串口输入：命令分发 + 噪声窗口"收割验证" ===============================
 // 串口命令：f = 切字体家族（SD 包自动发现），s = 切字号 16/24/32，
-// b = 切下一本书，m = 系统菜单，h = 状态（P6 4 键落地后绑同一套接口）
+// b = 切下一本书，m = 系统菜单，n = 主页（选书），h = 状态
+//（P6 4 键落地后绑同一套接口：Menu 短按 = n / 长按 = m）
 // 三个输入窗口分开处理（P4 定案 2026-09-28）：
 //   · 等待期（5s 面板空闲，用户输入主窗口）→ handleSerial 每 20ms 轮询即时执行。
 //     原来只在等待前读一次，等待期收到的字节滞留到本轮刷新后被 drain 吞掉
@@ -630,8 +748,10 @@ static void applyMenuResult(SysMenu::Result r) {
   if (r == SysMenu::REDRAW) {
     showMenuRefresh(false);        // 导航/动作：快刷（DTM1 = 屏上真实菜单帧）
   } else if (r == SysMenu::CLOSE) {
-    // 退出回书：restartPair 把当前对页重画进 draw 缓冲（不推进页码）；
-    // 失败（demo 页/首渲染前）就自然走下一对页
+    // 退出菜单 → 按来源还原：从主页开的回主页（快刷），否则回书页
+    // （restartPair 把当前对页重画进 draw 缓冲，不推进页码；
+    //   失败（demo 页/首渲染前）就自然走下一对页）
+    if (g_home) { drawHomeRefresh(false); return; }
     if (bookOk && book) book->restartPair();
     runRefresh(false);
   }
@@ -644,9 +764,15 @@ static void execSerialCmd(char c) {
     applyMenuResult(menu.key(c));
     return;
   }
+  // 主页打开：字节交给主页（j/k 选书、空格/回车打开、q/n 回书页；
+  // f/s/b/h/a 在主页期间刻意不响应），m 仍是系统菜单
+  if (g_home) {
+    if (c == 'm') { openSysMenu(); return; }
+    applyHomeResult(home.key(c));
+    return;
+  }
   if (c == 'm') {
-    menu.open();
-    showMenuRefresh(true);           // 开菜单：全刷，清上一帧残影
+    openSysMenu();                   // 全刷，清上一帧残影
     return;
   }
   if (c == 'f' && CJK.familyCount() > 1) {
@@ -663,6 +789,8 @@ static void execSerialCmd(char c) {
     prefs.putUChar("size", g_size);
     printFontState();
     previewFontChange();
+  } else if (c == 'n') {
+    openHome();                      // 主页（= Menu 短按；n = 再按一次回书页）
   } else if (c == 'b') {
     nextBook();
   } else if (c == 'h') {
@@ -725,11 +853,17 @@ static void handleSerial() {
 }
 
 // ===== P6 板载 4 键分发（电气台架 key_test 已过，2026-10-08）==========
-//   书页：Prev/Next = 上/下一对页（长按 600ms 后每 300ms 连发）、
-//         Menu 短按 = 开系统菜单、Font 短按 = 字号(s) / 长按 = 字体家族(f)
+//   书页：Prev/Next = 上/下一对页（长按 250ms 后每 300ms 连发）、
+//         Menu 短按 = 主页（选书，src/HomePage）/ 长按 250ms = 系统菜单、
+//         Font 短按 = 字号(s) / 长按 = 字体家族(f)
+//   主页：Prev/Next = 上下选书（连发=滚动）、Font 短按 = 打开选中书、
+//         Menu 短按 = 已在主页（不动）、长按 = 系统菜单
 //   菜单内：Prev/Next = 上下（连发=滚动）、Font 短按 = 执行、Menu = 退出
 //   睡着时按过的键：Keys 不补发按下 → 消费端再挡一次（sawPress）
 static bool g_keyDown[Keys::COUNT] = {false};   // RELEASE 前必须见过 PRESS
+// 菜单内按 Menu 退出的那一次按住：菜单在 PRESS 就关了，这次按住剩下的
+// LONG/RELEASE 必须吞掉 —— 否则 LONG 会再开一次菜单、RELEASE 会当成短按回主页
+static bool g_menuExitSwallow = false;
 
 static void keyAction(uint8_t id, uint8_t ev, bool longFired, bool sawPress) {
   if (menu.isOpen()) {
@@ -738,13 +872,31 @@ static void keyAction(uint8_t id, uint8_t ev, bool longFired, bool sawPress) {
       applyMenuResult(menu.key(id == Keys::PREV ? 'k' : 'j'));
     else if (id == Keys::FONT && ev == Keys::RELEASE && !longFired && sawPress)
       applyMenuResult(menu.key(' '));            // 短按 = 执行当前项
-    else if (id == Keys::MENU && ev == Keys::PRESS)
+    else if (id == Keys::MENU && ev == Keys::PRESS) {
+      g_menuExitSwallow = true;                  // 见上方注释
       applyMenuResult(menu.key('q'));            // 再按菜单键 = 退出
+    }
     return;                                      // LONG/REPEAT/多余 RELEASE 吞掉
   }
-  if (id == Keys::MENU && ev == Keys::PRESS) {
-    execSerialCmd('m');                          // 开菜单（全刷）
-    return;
+  if (id == Keys::MENU) {
+    // 一次按住在 PRESS 时不表态，等 LONG（长按到点）或 RELEASE（松开）再分岔：
+    // RELEASE 带 longFired 就能区分短按/长按，不必在按下时抢开菜单
+    if (ev == Keys::RELEASE) {
+      if (g_menuExitSwallow) { g_menuExitSwallow = false; return; }
+      if (!longFired && sawPress && !g_home) openHome();   // 短按 = 主页
+      return;
+    }
+    if (ev == Keys::LONG) {                      // 长按 = 系统菜单
+      if (!g_menuExitSwallow) openSysMenu();
+      return;
+    }
+    if (ev == Keys::PRESS) g_menuExitSwallow = false;   // 新一轮按住，清上轮标记
+    return;                                      // 等 LONG / RELEASE
+  }
+  if (g_home) {                                  // 主页：Font 短按 = 打开选中书
+    if (id == Keys::FONT && ev == Keys::RELEASE && !longFired && sawPress)
+      applyHomeResult(home.key(' '));
+    return;                                      // Prev/Next 在 drainKeys 里并批
   }
   if (id == Keys::FONT) {
     if (ev == Keys::LONG) execSerialCmd('f');                        // 长按 = 家族
@@ -755,7 +907,8 @@ static void keyAction(uint8_t id, uint8_t ev, bool longFired, bool sawPress) {
 }
 
 // 攒一批按键事件一次消费：连续的翻页事件（PRESS/LONG/REPEAT）合并成净位移 ——
-// 一次刷新 1.3s，期间攒下的按压只刷一次屏（连按 3 下 = 跨 3 页一次刷完）
+// 一次刷新 1.3s，期间攒下的按压只刷一次屏（连按 3 下 = 跨 3 页一次刷完）。
+// 主页开着时同一批并成一次选书位移（home.move），菜单内逐条交给 menu.key
 static void drainKeys() {
   Keys::Event ev[8];
   int n = 0;
@@ -772,18 +925,33 @@ static void drainKeys() {
                   ev[i].ev == Keys::REPEAT;
     if (!menuOpen && pageKey && pageEv) {
       int delta = 0, j = i;
-      while (j < n && (ev[j].id == Keys::PREV || ev[j].id == Keys::NEXT) &&
-             (ev[j].ev == Keys::PRESS || ev[j].ev == Keys::LONG ||
-              ev[j].ev == Keys::REPEAT)) {
+      // 翻页键的 RELEASE 一并吸收（不清批、不翻页）：连按 N 下产生的是
+      // PRESS,RELEASE 交替序列，RELEASE 断批会让每次点按各刷一次屏 ——
+      // 吸收后同一刷新窗口内的连按才真正并成一次刷新（本块头注释的承诺）
+      while (j < n && (ev[j].id == Keys::PREV || ev[j].id == Keys::NEXT)) {
+        if (ev[j].ev == Keys::RELEASE) {
+          g_keyDown[ev[j].id] = false;
+          j++;
+          continue;
+        }
+        // 事件枚举仅 PRESS/LONG/REPEAT/RELEASE 四种，到这里的都算翻页
         if (ev[j].ev == Keys::PRESS) g_keyDown[ev[j].id] = true;
         delta += (ev[j].id == Keys::NEXT) ? 1 : -1;
         j++;
       }
       if (delta) {
-        Serial.printf("[key] turn %+d pair(s) from %d event(s) [bnc=%lu ovf=%lu]\n",
-                      delta, j - i, (unsigned long)keys.bounce(),
-                      (unsigned long)keys.overflow());
-        turnPage(delta);
+        if (g_home) {
+          // 主页：同一批并成一次选中位移（连按/连发 = 一次快刷到位）
+          Serial.printf("[key] home select %+d from %d event(s) [bnc=%lu ovf=%lu]\n",
+                        delta, j - i, (unsigned long)keys.bounce(),
+                        (unsigned long)keys.overflow());
+          applyHomeResult(home.move(delta));
+        } else {
+          Serial.printf("[key] turn %+d pair(s) from %d event(s) [bnc=%lu ovf=%lu]\n",
+                        delta, j - i, (unsigned long)keys.bounce(),
+                        (unsigned long)keys.overflow());
+          turnPage(delta);
+        }
       }
       i = j;
       continue;
@@ -817,8 +985,8 @@ void loop() {
   }
   if (hallClosing()) enterDeepSleep();
 
-  // 菜单开着：屏保持菜单，跳过自动翻页（下一轮照常轮询串口/网络/霍尔）
-  if (menu.isOpen()) return;
+  // 菜单/主页开着：屏保持该 UI，跳过自动翻页（下一轮照常轮询串口/网络/霍尔）
+  if (menu.isOpen() || g_home) return;
 
   refreshOnce();
 }
