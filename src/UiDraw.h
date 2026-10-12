@@ -13,11 +13,32 @@
 //   drawCjkStr 标题大字：Unifont 最近邻放大，size 取 2 的幂（16/32）才不发虚
 //   drawBorder 2px 页框
 //
+// 美化辅助（1bpp 墨水屏风格）：
+//   drawThickRule    粗分隔线（2-3px）
+//   drawThinRule     细分隔线（1px）
+//   drawSelectArrow  选中项左侧实心三角
+//   drawSelectBar    选中项粗下划线（3px）
+//   drawSectionHead 分节标题：小实心方块 + 标题文字
+//   drawBullet       小实心圆点（列表项前缀）
+//   drawStatusDot    状态指示点（实心=开，空心=关）
+//   drawCenteredUtf8 居中混排行
+//
 // 前提：画布已 Paint_SelectImage 且 Paint_Clear(WHITE)（只写黑像素）；
 // 字库未装载时由调用方（SysMenu::draw / HomePage::draw）先补 CJK.begin()。
 uint32_t utf8At(const char* s, int len, int* used);
 void drawUtf8(int x, int y, const char* s, int maxX);
 void drawCjkStr(int x, int y, const char* s, int size);
 void drawBorder();
+
+// 美化辅助
+void drawThickRule(int x1, int y, int x2, int thick = 3);
+void drawThinRule(int x1, int y, int x2);
+void drawSelectArrow(int x, int y);
+void drawSelectBar(int x1, int y, int x2);
+void drawSectionHead(int x, int y, const char* s, int size);
+void drawBullet(int x, int y);
+void drawStatusDot(int x, int y, bool on);
+void drawCenteredUtf8(int y, const char* s, int maxX);
+int  measureUtf8(const char* s);
 
 #endif  // UI_DRAW_H

@@ -27,60 +27,69 @@ static const char* kHint[kItems][2] = {
 
 // ---- 绘制辅助 ----（已抽到 UiDraw.h/.cpp：utf8At / drawUtf8 / drawCjkStr / drawBorder）
 
-// 选中项右侧状态字（[开]/[关]/[热点]…）
-static String rowState(int i) {
-  String s = F("  ");
-  switch (i) {
-    case 0:
-      if (net.portalUp()) s += F("[热点]");
-      else if (net.staSsid()[0]) s += F("[已配]");
-      else s += F("[未配]");
-      break;
-    case 1: s += net.wifiOn() ? F("[开]") : F("[关]"); break;
-    case 2: s += net.otaOn() ? F("[开]") : F("[关]"); break;
-    case 3: s += net.upOn() ? F("[开]") : F("[关]"); break;
-  }
-  return s;
-}
-
 // ---- 左页：菜单列表 ----
 
 void SysMenu::drawLeft() {
   drawBorder();
+
+  // 标题区 + 粗分隔线
   drawCjkStr(24, 20, "系统菜单", 32);
-  Paint_DrawLine(24, 66, EinkPanel::PAGE_W - 24, 66,
-                 BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
+  drawThickRule(24, 62, EinkPanel::PAGE_W - 24);
 
   for (int i = 0; i < kItems; i++) {
-    int y = 94 + i * 52;
-    if (i == m_sel) {
-      Paint_DrawChar(24, y, '>', &Font16, BLACK, WHITE);
-      Paint_DrawLine(48, y + 19, EinkPanel::PAGE_W - 48, y + 19,
-                     BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
+    int y = 82 + i * 52;
+    bool sel = (i == m_sel);
+    if (sel) {
+      drawSelectArrow(24, y);          // 左侧实心三角
     }
     String row = kLabel[i];
-    row += rowState(i);
-    drawUtf8(48, y, row.c_str(), EinkPanel::PAGE_W - 32);
+    int textX = sel ? 42 : 36;
+    drawUtf8(textX, y, row.c_str(), EinkPanel::PAGE_W - 80);
+    // 状态指示点 + 状态文字
+    bool on = false;
+    switch (i) {
+      case 0: on = net.portalUp() || net.staSsid()[0]; break;
+      case 1: on = net.wifiOn(); break;
+      case 2: on = net.otaOn(); break;
+      case 3: on = net.upOn(); break;
+    }
+    int dotX = EinkPanel::PAGE_W - 70;
+    drawStatusDot(dotX, y, on);
+    // 状态文字
+    const char* stxt = "";
+    switch (i) {
+      case 0: stxt = net.portalUp() ? "热点" : (net.staSsid()[0] ? "已配" : "未配"); break;
+      case 1: stxt = net.wifiOn() ? "开" : "关"; break;
+      case 2: stxt = net.otaOn() ? "开" : "关"; break;
+      case 3: stxt = net.upOn() ? "开" : "关"; break;
+    }
+    drawUtf8(dotX + 12, y, stxt, EinkPanel::PAGE_W - 32);
+    if (sel) {
+      drawSelectBar(textX, y + 21, EinkPanel::PAGE_W - 48);
+    }
   }
 
-  Paint_DrawLine(24, 316, EinkPanel::PAGE_W - 24, 316,
-                 BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
-  drawUtf8(24, 334, kHint[m_sel][0], EinkPanel::PAGE_W - 32);
-  drawUtf8(24, 360, kHint[m_sel][1], EinkPanel::PAGE_W - 32);
+  // 说明区：细分隔线 + 两行说明
+  drawThinRule(24, 306, EinkPanel::PAGE_W - 24);
+  drawUtf8(24, 320, kHint[m_sel][0], EinkPanel::PAGE_W - 32);
+  drawUtf8(24, 346, kHint[m_sel][1], EinkPanel::PAGE_W - 32);
 
-  Paint_DrawLine(24, 566, EinkPanel::PAGE_W - 24, 566,
-                 BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
-  drawUtf8(24, 584, "j/k 选择 Enter 执行", EinkPanel::PAGE_W - 32);
-  drawUtf8(24, 610, "q/m 退出菜单（方向键亦可）", EinkPanel::PAGE_W - 32);
+  // 页脚：粗分隔线 + 居中提示
+  drawThickRule(24, 566, EinkPanel::PAGE_W - 24);
+  drawCenteredUtf8(584, "j/k 选择  Enter/空格 执行", EinkPanel::PAGE_W - 32);
+  drawCenteredUtf8(610, "q/m 退出（方向键亦可）", EinkPanel::PAGE_W - 32);
 }
 
 // ---- 右页：状态 + 网页地址 + 提示 ----
 
 void SysMenu::drawRight(int libCount) {
   drawBorder();
-  drawCjkStr(24, 20, "状态", 32);
 
-  int y = 68;
+  // 主标题 + 粗分隔线
+  drawCjkStr(24, 20, "状态", 32);
+  drawThickRule(24, 62, EinkPanel::PAGE_W - 24);
+
+  int y = 76;
   auto line = [&](const String& s) {
     drawUtf8(24, y, s.c_str(), EinkPanel::PAGE_W - 32);
     y += 26;
@@ -115,11 +124,14 @@ void SysMenu::drawRight(int libCount) {
   s += F(" 本");
   line(s);
 
-  y += 14;
-  drawCjkStr(24, y, "网页", 32);
-  y += 46;
+  // 网页地址区
+  y += 8;
+  drawThinRule(24, y, EinkPanel::PAGE_W - 24);
+  y += 12;
+  drawSectionHead(24, y, "网页", 24);
+  y += 38;
   if (st == NetSvc::OFF) {
-    drawUtf8(24, y, "WiFi 关闭 —先开左侧 WiFi 开关", EinkPanel::PAGE_W - 32);
+    drawUtf8(24, y, "WiFi 关闭 — 先开左侧 WiFi 开关", EinkPanel::PAGE_W - 32);
     y += 26;
   } else {
     s = F("配置 http://");
@@ -140,9 +152,12 @@ void SysMenu::drawRight(int libCount) {
     }
   }
 
-  y += 14;
-  drawCjkStr(24, y, "提示", 32);
-  y += 46;
+  // 提示区
+  y += 8;
+  drawThinRule(24, y, EinkPanel::PAGE_W - 24);
+  y += 12;
+  drawSectionHead(24, y, "提示", 24);
+  y += 38;
   drawUtf8(24, y, "改动立即生效并写 NVS", EinkPanel::PAGE_W - 32);
   y += 26;
   drawUtf8(24, y, "上传完成自动加入书库", EinkPanel::PAGE_W - 32);

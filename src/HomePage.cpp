@@ -44,12 +44,13 @@ static bool hasExt(const char* name, const char* ext) {
 
 void HomePage::drawLeft(const Ctx& ctx) {
   drawBorder();
+
+  // 标题区："书库" + 计数 + 粗分隔线
   drawCjkStr(24, 20, "书库", 32);
   char buf[48];
   snprintf(buf, sizeof(buf), "共 %d 本", ctx.count);
   drawUtf8(112, 34, buf, EinkPanel::PAGE_W - 32);
-  Paint_DrawLine(24, 66, EinkPanel::PAGE_W - 24, 66,
-                 BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
+  drawThickRule(24, 62, EinkPanel::PAGE_W - 24);
 
   if (ctx.count <= 0) {
     drawUtf8(24, ROW_TOP, "书库是空的 —— 用系统菜单里的", EinkPanel::PAGE_W - 32);
@@ -59,32 +60,40 @@ void HomePage::drawLeft(const Ctx& ctx) {
   int n = ctx.count < MAX_ROWS ? ctx.count : MAX_ROWS;
   for (int i = 0; i < n; i++) {
     int y = ROW_TOP + i * ROW_STEP;
-    if (i == m_sel) {                       // 选中：'>' + 行下划线（同 SysMenu）
-      Paint_DrawChar(24, y, '>', &Font16, BLACK, WHITE);
-      Paint_DrawLine(48, y + 21, EinkPanel::PAGE_W - 48, y + 21,
-                     BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
+    bool sel = (i == m_sel);
+    if (sel) {
+      drawSelectArrow(24, y);          // 左侧实心三角
     }
     String row = baseName(ctx.paths[i]);
     row += hasExt(ctx.paths[i], ".epub") ? F("  [epub]") : F("  [txt]");
     if (i == ctx.curIdx) row += F("  [在读]");
-    drawUtf8(48, y, row.c_str(), EinkPanel::PAGE_W - 32);   // 长文件名截断
+    int textX = sel ? 42 : 36;         // 选中项让位给三角
+    drawUtf8(textX, y, row.c_str(), EinkPanel::PAGE_W - 32);
+    if (sel) {
+      drawSelectBar(textX, y + 21, EinkPanel::PAGE_W - 48);  // 粗下划线
+    }
   }
 
-  Paint_DrawLine(24, FOOT_RULE_Y, EinkPanel::PAGE_W - 24, FOOT_RULE_Y,
-                 BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
-  drawUtf8(24, 584, "Prev/Next 选择  Font 短按打开", EinkPanel::PAGE_W - 32);
-  drawUtf8(24, 610, "Menu 短按主页  长按系统菜单", EinkPanel::PAGE_W - 32);
+  // 页脚：粗分隔线 + 居中提示
+  drawThickRule(24, FOOT_RULE_Y, EinkPanel::PAGE_W - 24);
+  drawCenteredUtf8(584, "Prev/Next 选择  Font 短按打开", EinkPanel::PAGE_W - 32);
+  drawCenteredUtf8(610, "Menu 短按主页  长按系统菜单", EinkPanel::PAGE_W - 32);
 }
 
 // ---- 右页：正在读 + 书库统计 + 按键说明 ----
 
 void HomePage::drawRight(const Ctx& ctx) {
   drawBorder();
+
+  // 主标题 + 粗分隔线
   drawCjkStr(24, 20, "主页", 32);
+  drawThickRule(24, 62, EinkPanel::PAGE_W - 24);
+
   char buf[64];
 
-  drawCjkStr(24, 76, "正在读", 32);
-  int y = 120;
+  // 正在读
+  drawSectionHead(24, 76, "正在读", 24);
+  int y = 110;
   if (ctx.curIdx >= 0 && ctx.curIdx < ctx.count) {
     drawUtf8(24, y, baseName(ctx.paths[ctx.curIdx]), EinkPanel::PAGE_W - 32);
     y += 26;
@@ -99,14 +108,18 @@ void HomePage::drawRight(const Ctx& ctx) {
   }
   drawUtf8(24, y, ctx.fontInfo, EinkPanel::PAGE_W - 32);
 
-  drawCjkStr(24, 216, "书库", 32);
+  // 书库统计
+  drawThinRule(24, 200, EinkPanel::PAGE_W - 24);
+  drawSectionHead(24, 212, "书库", 24);
   int nt = 0, ne = 0;
   for (int i = 0; i < ctx.count; i++) { if (hasExt(ctx.paths[i], ".epub")) ne++; else nt++; }
   snprintf(buf, sizeof(buf), "TXT %d 本   EPUB %d 本", nt, ne);
-  drawUtf8(24, 258, buf, EinkPanel::PAGE_W - 32);
-  drawUtf8(24, 284, "新书：Menu 长按 → 电子书上传服务", EinkPanel::PAGE_W - 32);
+  drawUtf8(24, 246, buf, EinkPanel::PAGE_W - 32);
+  drawUtf8(24, 272, "新书：Menu 长按 → 电子书上传服务", EinkPanel::PAGE_W - 32);
 
-  drawCjkStr(24, 328, "按键", 32);
+  // 按键说明
+  drawThinRule(24, 310, EinkPanel::PAGE_W - 24);
+  drawSectionHead(24, 322, "按键", 24);
   static const char* kHint[6] = {
     "Prev/Next  上下选择",
     "Font 短按  打开选中书",
@@ -116,7 +129,7 @@ void HomePage::drawRight(const Ctx& ctx) {
     "合盖深睡，开盖回上次状态",
   };
   for (int i = 0; i < 6; i++)
-    drawUtf8(24, 370 + i * 26, kHint[i], EinkPanel::PAGE_W - 32);
+    drawUtf8(24, 358 + i * 26, kHint[i], EinkPanel::PAGE_W - 32);
 }
 
 void HomePage::draw(uint8_t* fbL, uint8_t* fbR, const Ctx& ctx) {
