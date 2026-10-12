@@ -31,6 +31,17 @@ public:
 
   // 渲染接下来的左右两页。false = 书彻底不可用
   virtual bool renderPair(uint8_t* fbL, uint8_t* fbR) = 0;
+
+  // —— 阅读功能（书签/目录/进度跳转，2026-10-12）——
+  // 全书进度千分比 0..1000（0xFFFF = 未知）；TXT = 字节偏移/文件大小，
+  // EPUB = spine 章权重（zip 条目解压尺寸）+ 章内偏移比例
+  virtual uint16_t permille() = 0;
+  // 跳到全书 p/10 % 处（章首对齐 EPUB 按章权重选章再章内定位；页号为估计值）
+  virtual bool jumpPermille(uint16_t p) = 0;
+  // 目录条目数（0 = 无目录）；EPUB 解析 NCX/nav 失败时退化"第N章"合成目录
+  virtual int tocCount() = 0;
+  virtual bool tocTitle(int idx, char* out, int n) = 0;
+  virtual bool jumpToToc(int idx) = 0;   // 跳到目录第 idx 条（章首）
 };
 
 #endif  // BOOK_H

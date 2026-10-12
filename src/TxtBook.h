@@ -82,9 +82,32 @@ public:
   // 关掉串口头部 dump（EPUB 章节切换太频繁，日志会刷屏）
   void setQuiet(bool q) { m_quiet = q; }
 
+  // —— 阅读功能（2026-10-12：书签/目录/进度跳转，见 Book.h 注释）——
+  uint16_t permille() override;
+  bool jumpPermille(uint16_t p) override { return seekTo(offAtPermille(p)); }
+  int tocCount() override;
+  bool tocTitle(int idx, char* out, int n) override;
+  bool jumpToToc(int idx) override;
+
+  // 跳到章/书签记录的偏移（seekTo 的对内包装：目录跳转用）
+  bool seekTo(long off);          // 定位 + UTF-8 边界对准 + 页号估算
+  long offAtPermille(uint16_t p) const;
+  uint32_t estPageAt(long off) const;  // 按已渲染页平均字节数估页号
+  long textSize() const { return m_file ? (long)m_file.size() : 0; }
+  void avgBytes(uint32_t* num, uint32_t* den) const { *num = m_avgNum; *den = m_avgDen; }
+  void setPermille(int p) { m_permille = p; }  // EPUB 注入全局进度（-1 = 自行按字节算）
+
 private:
+  bool scanToc();                 // TXT 目录：扫"第X章/Chapter N"标题行（LittleFS 缓存）
 
   File m_file;
+  fs::FS* m_fs = nullptr;         // 目录扫描/标题回读用（与排版句柄独立）
+  char m_path[64] = "";           // open 的路径（目录缓存键哈希用）
+  int m_permille = -1;            // ≥0 = 外部注入的全局进度（EPUB），页眉显示用
+  uint32_t m_avgNum = 0, m_avgDen = 0;  // 已渲染字节/页数 → 跳转页号估算
+  static const int TOC_MAX = 200; // TXT 目录条目上限
+  long m_tocOff[TOC_MAX];         // 章节标题行的文件偏移
+  int m_nToc = -1;                // <0 = 未扫描
   bool m_ok = false;
   bool m_loop = true;    // false = EPUB 模式：EOF 停住不回头（setLoop 切换）
   bool m_hitEof = false; // 上一次渲染触碰过文件尾（EPUB 章末推进用）

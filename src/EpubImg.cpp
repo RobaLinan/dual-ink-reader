@@ -4,6 +4,8 @@
 #include <ESP32epdx.h>       // Paint_SetPixel / BLACK / WHITE（GUI_Paint 全局画布）
 #include "tjpgd/tjpgd.h"     // ChaN TJpgDec R0.03（vendored，见 src/VENDOR.md）
 #include <PNGdec.h>          // ~/Arduino/libraries/PNGdec（Larry Bank，BSD）
+// 最后 include：Serial 重定向进日志环形缓冲（/debug 网页调试台，DESIGN §11）
+#include "DbgLog.h"
 
 // === 4×4 Bayer 有序抖动 ===
 // 阈值矩阵 0..15：黑 if 亮度 < (bayer+1)*16。有序抖动给插画灰阶的观感远好于硬阈值

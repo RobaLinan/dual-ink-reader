@@ -2,10 +2,15 @@
 #include "Storage.h"
 #include "CjkFont.h"
 #include "EinkPanel.h"
+#include "Bookmarks.h"      // hashPath：TXT 目录缓存键与书签键同一哈希
 #include "SD_MMC.h"
 #include <ESP32epdx.h>
+#include <LittleFS.h>
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
+// 最后 include：Serial 重定向进日志环形缓冲（/debug 网页调试台，DESIGN §11）
+#include "DbgLog.h"
 
 // === 排版常量：按像素宽计量（DESIGN §5.5 中英混排）===
 // 画布是竖版页 EinkPanel::PAGE_W(480) × PAGE_H(648)（短边为横边），由
@@ -398,6 +403,11 @@ bool TxtBook::open(fs::FS& fs, const char* path) {
   m_hitEof = false;
   m_page = 0;
   m_pairStart = -1;
+  m_avgNum = 0; m_avgDen = 0;   // 平均页字节重新累计（跳转页号估算用）
+  m_permille = -1;              // 进度显示回到"自行按字节算"
+  m_nToc = -1;                  // 目录缓存失效（书可能换了），下次 tocCount 重扫
+  m_fs = &fs;
+  snprintf(m_path, sizeof(m_path), "%s", path);
   if (!Storage::begin()) return false;
 
   setTier(TXT_SIZE_PX);            // 默认档（TxtBook.h 可改），按键阶段可运行期切换
@@ -440,6 +450,11 @@ bool TxtBook::renderPair(uint8_t* fbL, uint8_t* fbR) {
   if (!m_ok) return false;
   m_pairStart = m_file.position();          // 记录本对页起点（字体切换时回跳重排）
   m_pairStartPage = m_page;
+  // 页眉进度%按对页起点算（直接算，不调 permille()——它优先返回注入值会自锁；
+  // EPUB 的 m_txt 不走这里，由 EpubBook::renderPair 注入全局值）
+  { uint32_t sz = m_file.size();
+    m_permille = (sz && m_pairStart >= 0)
+                     ? (int)((uint64_t)m_pairStart * 1000 / sz) : -1; }
   bool ok = renderPage(fbL, m_page) && renderPage(fbR, m_page + 1);
   if (!ok) { m_ok = false; return false; }
   m_page += 2;
@@ -492,12 +507,22 @@ static void drawHeader(const char* hdr) {
   }
 }
 
+// 页眉文本：有进度（自行按字节算或 EPUB 注入）时 "title   p.N · 42%"，
+// 未知时退回旧格式 "title   page N"。% 取整四舍五入。
+static void makeHeader(char* hdr, size_t n, const char* title, uint32_t pageNo, int permille) {
+  if (permille >= 0 && permille <= 1000)
+    snprintf(hdr, n, "%s   p.%lu %u%%", title, (unsigned long)pageNo,
+             (unsigned)(permille + 5) / 10);
+  else
+    snprintf(hdr, n, "%s   page %lu", title, (unsigned long)pageNo);
+}
+
 // 空白页（页眉+分隔线，正文全白）：EPUB 章节在右页中间结束
 void TxtBook::renderBlank(uint8_t* fb, uint32_t pageNo) {
   Paint_SelectImage(fb);
   Paint_Clear(WHITE);
-  char hdr[48];
-  snprintf(hdr, sizeof(hdr), "%s   page %lu", m_title, (unsigned long)pageNo);
+  char hdr[64];
+  makeHeader(hdr, sizeof(hdr), m_title, pageNo, m_permille);
   drawHeader(hdr);
   Paint_DrawLine(TXT_X, 26, EinkPanel::PAGE_W - 1 - TXT_X, 26,
                  BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
@@ -511,8 +536,8 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
   Paint_SelectImage(fb);
   Paint_Clear(WHITE);
 
-  char hdr[48];
-  snprintf(hdr, sizeof(hdr), "%s   page %lu", m_title, (unsigned long)pageNo);
+  char hdr[64];
+  makeHeader(hdr, sizeof(hdr), m_title, pageNo, m_permille);
   drawHeader(hdr);                              // 页眉也走混排（文件名可能带中文）
   Paint_DrawLine(TXT_X, 26, EinkPanel::PAGE_W - 1 - TXT_X, 26,
                  BLACK, LINE_STYLE_SOLID, DOT_PIXEL_1X1);
@@ -586,8 +611,220 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
   if (s_rewindPos >= 0) m_file.seek(s_rewindPos);
   else if (s_lineLen > 0) m_file.seek(s_lineStart);
 
+  // 平均页字节累计（跳转页号估算用）：EOF 回卷会让 position 小于页起点，只记正值
+  { long d = (long)m_file.position() - s_pageStart;
+    if (d > 0) { m_avgNum += (uint32_t)d; m_avgDen++; } }
+
   Serial.printf("[txt] page %lu: pos %ld->%ld, %d lines, %lu ms\n",
                 (unsigned long)pageNo, s_pageStart, (long)m_file.position(),
                 s_lines, (unsigned long)(millis() - t0));
   return s_lines > 0;
+}
+
+// ==== 阅读功能（2026-10-12：进度%/目录/跳转）================================
+
+// 全书进度千分比：字节偏移/文件大小（EPUB 由 EpubBook 注入全局值，不走这里）
+uint16_t TxtBook::permille() {
+  if (m_permille >= 0 && m_permille <= 1000) return (uint16_t)m_permille;
+  if (!m_file) return 0xFFFF;
+  uint32_t sz = m_file.size();
+  if (!sz) return 0xFFFF;
+  long pos = m_pairStart >= 0 ? m_pairStart : (long)m_file.position();
+  if (pos < 0) pos = 0;
+  uint32_t p = (uint32_t)((uint64_t)pos * 1000 / sz);
+  return p > 1000 ? 1000 : (uint16_t)p;
+}
+
+long TxtBook::offAtPermille(uint16_t p) const {
+  if (!m_file) return -1;
+  uint32_t sz = m_file.size();
+  return (long)((uint64_t)p * sz / 1000);
+}
+
+uint32_t TxtBook::estPageAt(long off) const {
+  if (!m_avgNum || !m_avgDen) return 0;
+  uint32_t pg = (uint32_t)((uint64_t)off * m_avgDen / m_avgNum);
+  return pg & ~1u;          // 对页对齐（页号永远偶数起点，与 renderPair 语义一致）
+}
+
+// 跳转定位（进度%/目录/书签共用）：seek 后向前对准 UTF-8 字符边界
+// （按字节算的 % 可能落进多字节序列中间），页号按平均页字节估算。
+// 不渲染；调用方随后 runRefresh 重画。
+bool TxtBook::seekTo(long off) {
+  if (!m_ok || !m_file) return false;
+  long sz = (long)m_file.size();
+  if (sz <= 0) return false;
+  if (off < 0) off = 0;
+  if (off >= sz) off = sz - 1;
+  if (!m_file.seek(off)) return false;
+  while (off < sz - 1) {                 // 跳过接续字节 (10xxxxxx)
+    uint8_t b;
+    if (m_file.read(&b, 1) != 1) break;
+    if ((b & 0xC0) != 0x80) break;
+    off++;
+  }
+  if (!m_file.seek(off)) return false;
+  m_page = estPageAt(off);
+  m_pairStart = -1;                      // 下一 renderPair 重记对页起点
+  return true;
+}
+
+int TxtBook::tocCount() {
+  if (m_nToc < 0) scanToc();
+  return m_nToc;
+}
+
+bool TxtBook::jumpToToc(int idx) {
+  if (idx < 0 || idx >= tocCount()) return false;
+  return seekTo(m_tocOff[idx]);          // 章节标题行首 = 天然页起点
+}
+
+// 目录标题回读：独立文件句柄（不碰排版游标），取标题行并去尾空白
+bool TxtBook::tocTitle(int idx, char* out, int n) {
+  if (out && n > 0) out[0] = '\0';
+  if (!out || n <= 0 || idx < 0 || idx >= tocCount() || !m_fs || !m_path[0])
+    return false;
+  File f = m_fs->open(m_path, FILE_READ);
+  if (!f) return false;
+  f.seek(m_tocOff[idx]);
+  int got = f.read((uint8_t*)out, n - 1);
+  f.close();
+  if (got < 0) got = 0;
+  out[got] = '\0';
+  char* nl = strchr(out, '\n');          // 截到行尾
+  if (nl) *nl = '\0';
+  while (got > 0 && (out[got - 1] == '\r' || out[got - 1] == ' ' || out[got - 1] == '\t'))
+    out[--got] = '\0';
+  return true;
+}
+
+// 行内容是否为章节标题（启发式，短行 + 行首模式）：
+//   "第X章/回/节/卷/部/篇"（X = 数字或中文数字）、"Chapter N"、整行短词
+//   （序章/前言/楔子/尾声/后记…）。误报无害（多一个目录项），漏报不修。
+static bool isChapterHeading(const char* s, int len) {
+  if (len <= 0 || len > 78) return false;
+  int i = 0;
+  while (i < len && (s[i] == ' ' || s[i] == '\t') && i < 4) i++;
+  if (len - i >= 3 && (uint8_t)s[i] == 0xE3 && (uint8_t)s[i + 1] == 0x80 &&
+      (uint8_t)s[i + 2] == 0x80)                       // 全角空格 U+3000
+    i += 3;
+  const char* p = s + i;
+  int n = len - i;
+  if (n <= 0) return false;
+
+  if (n >= 8 && strncasecmp(p, "chapter", 7) == 0 &&
+      (p[7] == ' ' || p[7] == '\t' || isdigit((uint8_t)p[7])))
+    return true;
+
+  static const char* whole[] = {   // 整行短词
+    "\xE5\xBA\x8F\xE7\xAB\xA0",   // 序章
+    "\xE5\xBA\x8F\xE8\xA8\x80",   // 序言
+    "\xE5\x89\x8D\xE8\xA8\x80",   // 前言
+    "\xE5\xBC\x95\xE8\xA8\x80",   // 引言
+    "\xE6\xA5\x94\xE5\xAD\x90",   // 楔子
+    "\xE5\xBA\x8F\xE5\xB9\x95",   // 序幕
+    "\xE5\xB0\xBE\xE5\xA3\xB0",   // 尾声
+    "\xE5\x90\x8E\xE8\xAE\xB0",   // 后记
+    "\xE7\x95\xAA\xE5\xA4\x96",   // 番外
+    "\xE7\xBB\x88\xE7\xAB\xA0",   // 终章
+    NULL };
+  for (int w = 0; whole[w]; w++)
+    if (n == (int)strlen(whole[w]) && memcmp(p, whole[w], n) == 0) return true;
+
+  // 第<num>章/回/节/卷/部/篇：首个码点 = 第，其后 ≤16 个码点内出现章回节卷部篇，
+  // 中间只允许数字/中文数字（一二三四五六七八九十百千万零两〇）
+  int u;
+  uint32_t cp = utf8At(p, n, &u);
+  if (cp != 0x7B2C) return false;                      // 第
+  i = u;
+  int cps = 0;
+  while (i < n && cps < 16) {
+    cp = utf8At(p + i, n - i, &u);
+    i += u; cps++;
+    if (cp == 0x7AE0 || cp == 0x8282 || cp == 0x56DE || cp == 0x5377 ||
+        cp == 0x90E8 || cp == 0x7BC7)                  // 章节回卷部篇
+      return true;
+    bool numeral = (cp >= '0' && cp <= '9') ||
+        cp == 0x4E00 || cp == 0x4E8C || cp == 0x4E09 || cp == 0x56DB ||
+        cp == 0x4E94 || cp == 0x516D || cp == 0x4E03 || cp == 0x516B ||
+        cp == 0x4E5D || cp == 0x5341 || cp == 0x767E || cp == 0x5343 ||
+        cp == 0x4E07 || cp == 0x96F6 || cp == 0x4E24 || cp == 0x3007;
+    if (!numeral) return false;
+  }
+  return false;
+}
+
+// 扫目录：独立句柄流式扫标题行（不碰排版游标）。结果缓存到片内 LittleFS
+// （键 = 路径哈希，失效键 = 书文件大小；坑 18 后 LittleFS 写是安全的，
+// 比每次进目录都全文件重扫强 —— 大文件扫一遍要好几秒）。
+bool TxtBook::scanToc() {
+  m_nToc = 0;
+  if (!m_fs || !m_path[0]) return false;
+
+  uint32_t fsize = 0;
+  {
+    File f = m_fs->open(m_path, FILE_READ);
+    if (!f) return false;
+    fsize = f.size();
+    f.close();
+  }
+
+  char cache[32];
+  snprintf(cache, sizeof(cache), "/__toc_%08lx",
+           (unsigned long)Bookmarks::hashPath(m_path));
+  {
+    File c = LittleFS.open(cache, FILE_READ);
+    if (c) {
+      uint32_t hdr[3];
+      if (c.read((uint8_t*)hdr, sizeof(hdr)) == (int)sizeof(hdr) &&
+          hdr[0] == 0x31434F54UL /* 'TOC1' 小端 */ &&
+          hdr[1] == fsize && hdr[2] <= (uint32_t)TOC_MAX &&
+          c.read((uint8_t*)m_tocOff, hdr[2] * 4) == (int)(hdr[2] * 4)) {
+        m_nToc = (int)hdr[2];
+        c.close();
+        return true;
+      }
+      c.close();
+    }
+  }
+
+  uint32_t t0 = millis();
+  File f = m_fs->open(m_path, FILE_READ);
+  if (!f) return false;
+  char line[96];
+  int ll = 0;
+  long lineStart = 0;
+  bool sol = true;
+  long pos = 0;
+  while (pos < (long)fsize) {
+    uint8_t buf[512];
+    int chunk = f.read(buf, sizeof(buf));
+    if (chunk <= 0) break;
+    for (int k = 0; k < chunk; k++) {
+      char ch = (char)buf[k];
+      if (sol) { lineStart = pos + k; sol = false; ll = 0; }
+      if (ch == '\n') {
+        if (isChapterHeading(line, ll) && m_nToc < TOC_MAX)
+          m_tocOff[m_nToc++] = lineStart;
+        sol = true;
+      } else if (ll < (int)sizeof(line) - 1) {
+        line[ll++] = ch;
+      } else {
+        sol = true;                    // 超长行不可能是标题，放弃本行
+      }
+    }
+    pos += chunk;
+  }
+  f.close();
+
+  File c = LittleFS.open(cache, FILE_WRITE);
+  if (c) {
+    uint32_t hdr[3] = { 0x31434F54UL, fsize, (uint32_t)m_nToc };
+    c.write((uint8_t*)hdr, sizeof(hdr));
+    if (m_nToc) c.write((uint8_t*)m_tocOff, m_nToc * 4);
+    c.close();
+  }
+  Serial.printf("[toc] %s: %d 章 (%lu ms)\n", m_path, m_nToc,
+                (unsigned long)(millis() - t0));
+  return true;
 }

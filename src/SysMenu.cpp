@@ -22,7 +22,7 @@ static const char* kHint[kItems][2] = {
   { "开配置热点，手机连上后", "网页里选 WiFi 输密码" },
   { "总开关：开=连路由器或", "开热点，关=断电省电(默认)" },
   { "开=arduino-cli 网络上传", "  + 网页 /update 传 bin" },
-  { "开=网页上传书到 /books", "（需先开 WiFi）" },
+  { "开=网页上传/管理书库", "（/upload /library，需先开 WiFi）" },
 };
 
 // ---- 绘制辅助 ----（已抽到 UiDraw.h/.cpp：utf8At / drawUtf8 / drawCjkStr / drawBorder）
@@ -142,6 +142,10 @@ void SysMenu::drawRight(int libCount) {
       s = F("上传 http://");
       s += net.ip();
       s += F("/upload");
+      line(s);
+      s = F("书库 http://");
+      s += net.ip();
+      s += F("/library");
       line(s);
     }
     if (net.otaOn()) {

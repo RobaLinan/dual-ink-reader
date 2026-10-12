@@ -8,6 +8,9 @@
 #include <SD_MMC.h>
 
 #include "Storage.h"
+#include <esp_system.h>   // esp_reset_reason：/debug 页显示本次复位原因
+// 最后 include：Serial 重定向进日志环形缓冲（/debug 网页调试台，DESIGN §11）
+#include "DbgLog.h"
 
 // 单例 + 单 WebServer：路由全部在 setupHttp 一次性装好，起停只管 begin/stop
 NetSvc net;
@@ -54,6 +57,53 @@ static void htmlEscape(String& out, const String& v) {
     else if (c == '\'') out += F("&#39;");
     else out += c;
   }
+}
+
+// URL 百分号编码（UTF-8 字节逐个编；浏览器会再解码回原始文件名）
+static String urlEnc(const String& s) {
+  static const char h[] = "0123456789ABCDEF";
+  String o;
+  o.reserve(s.length() * 3);
+  for (unsigned i = 0; i < s.length(); i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x20 || c > 0x7E || c == '%' || c == '&' || c == '=' || c == '+' ||
+        c == '#' || c == '?') {
+      o += '%'; o += h[c >> 4]; o += h[c & 15];
+    } else o += (char)c;
+  }
+  return o;
+}
+
+// 带 XHR 进度条的上传表单（/upload 与 /update 共用）。
+// 原生 form POST 浏览器只给转圈，看不到百分比 —— 改 XHR：
+// upload.onprogress 给 百分比/已传大小/速率；onload 显示结果。服务端处理不变。
+static String uploadForm(const char* accept, const char* note, const char* btn) {
+  String p;
+  p.reserve(1600);
+  p += F("<form id=u enctype=multipart/form-data method=post>"
+         "<input type=file name=file accept='");
+  p += accept;
+  p += F("' required><button type=submit>");
+  p += btn;
+  p += F("</button></form>"
+         "<div class=bar><i id=p></i></div><pre id=m></pre>"
+         "<style>.bar{height:1em;border:1px solid #888;margin:.6em 0}"
+         ".bar i{display:block;height:100%;width:0;background:#444}</style>"
+         "<script>u.onsubmit=function(e){e.preventDefault();var f=u.file.files[0];"
+         "if(!f)return;m.textContent='开始传输…';"
+         "var x=new XMLHttpRequest(),t0=Date.now();"
+         "x.upload.onprogress=function(e){if(e.lengthComputable){var q=e.loaded/e.total;"
+         "p.style.width=(q*100).toFixed(0)+'%';"
+         "m.textContent=(q*100).toFixed(0)+'%  '+(e.loaded/1048576).toFixed(1)+' / '"
+         "+(e.total/1048576).toFixed(1)+' MB  '+((e.loaded/1048576)/((Date.now()-t0)/1000)).toFixed(2)+' MB/s';}};"
+         "x.onload=function(){if(x.status===200){p.style.width='100%';"
+         "m.textContent='\\u2714 完成';}else{m.textContent='\\u2718 失败 HTTP '+x.status;}};"
+         "x.onerror=function(){m.textContent='\\u2718 网络错误（连接中断？）';};"
+         "x.open('POST',location.pathname);x.send(new FormData(u));};</script>"
+         "<p>");
+  p += note;
+  p += F("</p>");
+  return p;
 }
 
 static const char kHead[] =
@@ -248,6 +298,12 @@ void NetSvc::setupHttp() {
   s_srv.on("/update", HTTP_GET, [this]() { handleUpdateForm(); });
   s_srv.on("/update", HTTP_POST, [this]() { handleUpdateResult(); },
                                  [this]() { updateChunk(); });
+  s_srv.on("/library", HTTP_GET, [this]() { handleLibrary(); });
+  s_srv.on("/library/del", HTTP_POST, [this]() { handleLibraryDel(); });
+  s_srv.on("/library/get", HTTP_GET, [this]() { handleLibraryGet(); });
+  s_srv.on("/debug", HTTP_GET, [this]() { handleDebug(); });
+  s_srv.on("/debug/log", HTTP_GET, [this]() { handleDebugLog(); });
+  s_srv.on("/debug/act", HTTP_POST, [this]() { handleDebugAct(); });
   s_srv.onNotFound([]() { s_srv.send(404, "text/plain", "404"); });
 }
 
@@ -260,8 +316,9 @@ void NetSvc::handleIndex() {
   h += F("<li>OTA 更新："); h += m_otaOn ? F("开") : F("关"); h += F("</li>");
   h += F("<li>电子书上传："); h += m_upOn ? F("开") : F("关"); h += F("</li>");
   h += F("</ul><p><a href=/wifi>WiFi 配置</a>");
-  if (m_upOn) h += F("<a href=/upload>上传电子书</a>");
+  if (m_upOn) h += F("<a href=/upload>上传电子书</a><a href=/library>书库管理</a>");
   if (m_otaOn) h += F("<a href=/update>固件更新</a>");
+  h += F("<a href=/debug>调试 /debug</a>");
   h += F("</p>");
   String page = kHead;
   page += h;
@@ -318,14 +375,13 @@ void NetSvc::handleUploadForm() {
     return;
   }
   String page;
-  page.reserve(900);
+  page.reserve(1600);
   page += kHead;
-  page += F("<h3>上传电子书</h3><p>支持 .txt / .epub，写入 SD 卡 <b>/books/</b>"
-            "（重名覆盖），完成后自动加入书库。</p>"
-            "<form enctype=multipart/form-data method=post>"
-            "<input type=file name=file accept='.txt,.epub' required>"
-            "<button type=submit>上传</button></form>"
-            "<p><a href=/>返回</a></p>");
+  page += F("<h3>上传电子书</h3>");
+  page += uploadForm(".txt,.epub",
+                     "支持 .txt / .epub，写入 SD 卡 /books/（重名覆盖），完成后自动加入书库。"
+                     "<a href=/library>书库管理</a> <a href=/>返回</a>",
+                     "上传");
   s_srv.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -479,15 +535,14 @@ void NetSvc::handleUpdateForm() {
     return;
   }
   String page;
-  page.reserve(900);
+  page.reserve(1600);
   page += kHead;
-  page += F("<h3>固件更新 (OTA)</h3>"
-            "<p>选择 arduino-cli 编译出的应用镜像 <b>eink.ino.bin</b>"
-            "（⚠️ 不是 eink.ino.merged.bin，灌合并镜像会变砖）。更新期间别断电。</p>"
-            "<form enctype=multipart/form-data method=post>"
-            "<input type=file name=file accept=.bin required>"
-            "<button type=submit>更新并重启</button></form>"
-            "<p><a href=/>返回</a></p>");
+  page += F("<h3>固件更新 (OTA)</h3>");
+  page += uploadForm(".bin",
+                     "选择 arduino-cli 编译出的应用镜像 <b>eink.ino.bin</b>"
+                     "（⚠️ 不是 eink.ino.merged.bin，灌合并镜像会变砖）。更新期间别断电。"
+                     "<a href=/>返回</a>",
+                     "更新并重启");
   s_srv.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -536,4 +591,269 @@ void NetSvc::handleUpdateResult() {
   else h += F("详见设备串口日志");
   h += F("</p><p><a href=/update>返回</a></p>");
   s_srv.send(400, "text/html; charset=utf-8", h);
+}
+
+// ---- 书库管理（/library：列表 / 下载 / 删除）--------------------------------
+// 与 /upload 共用"电子书上传服务"开关（= 网页书库服务总开关）。
+// 删除走 NVS 书签清理 + SD remove + 回调 .ino 重扫（可能在读的书被换/被关）。
+
+void NetSvc::handleLibrary() {
+  if (!m_upOn) {
+    s_srv.send(403, "text/plain", "library service is off (menu: 电子书上传服务)");
+    return;
+  }
+  String page;
+  page.reserve(2600);
+  page += kHead;
+  page += F("<h3>书库管理</h3>");
+  if (!Storage::begin()) {
+    page += F("<p>SD 卡不可用</p>");
+  } else {
+    uint64_t tot = SD_MMC.totalBytes(), used = SD_MMC.usedBytes();
+    page += F("<p>SD 卡："); page += String((unsigned long)(used >> 20));
+    page += F(" / "); page += String((unsigned long)(tot >> 20)); page += F(" MB</p><ul>");
+    File dir = SD_MMC.open("/books");
+    if (dir) {
+      for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        if (f.isDirectory()) continue;
+        const char* n = f.path();
+        char base[64];
+        if (!n || !sanitizeName(n, base, sizeof(base)) ||
+            !(extIs(base, ".txt") || extIs(base, ".epub")))
+          continue;
+        size_t sz = f.size();
+        page += F("<li><b>");
+        { String esc; htmlEscape(esc, String(base)); page += esc; }
+        page += F("</b> （");
+        page += sz >= 1048576 ? String((float)sz / 1048576, 1) + F(" MB")
+                              : String((unsigned long)(sz >> 10)) + F(" KB");
+        page += F("） <a href='/library/get?f="); page += urlEnc(base);
+        page += F("'>下载</a> <button type=button data-n='");
+        { String esc; htmlEscape(esc, String(base)); page += esc; }
+        page += F("' onclick=\"return del(this)\">删除</button></li>");
+      }
+      dir.close();
+    }
+    page += F("</ul><p><a href=/upload>上传电子书</a> <a href=/>返回</a></p>"
+              "<script>function del(b){if(!confirm('删除《'+b.dataset.n+'》？"
+              "书签与进度一并清除，不可恢复'))return false;"
+              "var x=new XMLHttpRequest();x.onload=function(){location.reload()};"
+              "x.open('POST','/library/del');"
+              "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');"
+              "x.send('f='+encodeURIComponent(b.dataset.n));return false;}</script>");
+  }
+  s_srv.send(200, "text/html; charset=utf-8", page);
+}
+
+void NetSvc::handleLibraryDel() {
+  if (!m_upOn) {
+    s_srv.send(403, "text/plain", "library service is off");
+    return;
+  }
+  String f = s_srv.arg("f");
+  char base[64];
+  if (!sanitizeName(f.c_str(), base, sizeof(base)) ||
+      !(extIs(base, ".txt") || extIs(base, ".epub"))) {
+    s_srv.send(400, "text/plain", "bad name");
+    return;
+  }
+  if (!Storage::begin()) { s_srv.send(500, "text/plain", "SD unavailable"); return; }
+  char path[80];
+  snprintf(path, sizeof(path), "/books/%s", base);
+  File chk = SD_MMC.open(path, FILE_READ);
+  if (!chk) { s_srv.send(404, "text/plain", "not found"); return; }
+  chk.close();
+  if (!SD_MMC.remove(path)) {
+    s_srv.send(500, "text/plain", "remove failed (SD write wedged?)");
+    return;
+  }
+  Serial.printf("[net] library delete: %s\n", path);
+  s_srv.send(200, "text/html; charset=utf-8", String(kHead) + F("<p>已删除。</p>"));
+  if (onBookRemoved) onBookRemoved(path);
+}
+
+void NetSvc::handleLibraryGet() {
+  if (!m_upOn) {
+    s_srv.send(403, "text/plain", "library service is off");
+    return;
+  }
+  String f = s_srv.arg("f");
+  char base[64];
+  if (!sanitizeName(f.c_str(), base, sizeof(base)) ||
+      !(extIs(base, ".txt") || extIs(base, ".epub"))) {
+    s_srv.send(400, "text/plain", "bad name");
+    return;
+  }
+  if (!Storage::begin()) { s_srv.send(500, "text/plain", "SD unavailable"); return; }
+  char path[80];
+  snprintf(path, sizeof(path), "/books/%s", base);
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file) { s_srv.send(404, "text/plain", "not found"); return; }
+  s_srv.sendHeader("Content-Disposition",
+                   "attachment; filename*=UTF-8''" + urlEnc(base));
+  s_srv.streamFile(file, "application/octet-stream");
+  file.close();
+}
+
+// ---- /debug 网页调试台（DESIGN §11）------------------------------------------
+// 屏幕挂了的救砖通道：设备/屏幕/存储状态（经 onDbgInfo 回调从 eink.ino 注入）
+// + 复位面板/重画/翻页/重启动作 + 串口日志尾巴（DbgLog 环形缓冲增量拉取，
+// /debug/log 2s 一轮）。硬件状态一律不在这边猜，全问 eink.ino。
+
+static const char kBuild[] = __DATE__ " " __TIME__;   // 固件编译时间戳
+
+static const char* resetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "上电";
+    case ESP_RST_EXT:       return "外部复位（EN 键/烧录）";
+    case ESP_RST_SW:        return "软件重启";
+    case ESP_RST_PANIC:     return "Panic（崩溃）";
+    case ESP_RST_INT_WDT:   return "中断看门狗超时";
+    case ESP_RST_TASK_WDT:  return "任务看门狗超时";
+    case ESP_RST_WDT:       return "看门狗超时";
+    case ESP_RST_DEEPSLEEP: return "深睡唤醒";
+    case ESP_RST_BROWNOUT:  return "欠压（Brownout）";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "未知";
+  }
+}
+
+// /debug 动作按钮（POST 回 /debug/act → 302 回 /debug）。js = 追加的 onsubmit
+static String dbgForm(const char* a, const char* label, const char* js = nullptr) {
+  String f;
+  f.reserve(192);
+  f += F("<form method=post action=/debug/act");
+  if (js && *js) { f += F(" onsubmit=\""); f += js; f += '"'; }
+  f += F("><input type=hidden name=a value=");
+  f += a;
+  f += F("><button type=submit>");
+  f += label;
+  f += F("</button></form>");
+  return f;
+}
+
+void NetSvc::handleDebug() {
+  String h;
+  h.reserve(3600);
+  h += F("<h3>调试台</h3><h4>设备</h4><ul style='list-style:none;padding:0'>");
+  uint32_t up = millis() / 1000;
+  h += F("<li>运行：");
+  if (up >= 3600) { h += String(up / 3600); h += F(" 时 "); }
+  h += String((up / 60) % 60); h += F(" 分 "); h += String(up % 60); h += F(" 秒</li>");
+  h += F("<li>复位原因："); h += resetReasonText(); h += F("</li>");
+  h += F("<li>固件编译："); h += kBuild; h += F("</li>");
+  h += F("<li>内存：heap 空闲 "); h += String(ESP.getFreeHeap() >> 10);
+  h += F(" KB / 历史最低 "); h += String(ESP.getMinFreeHeap() >> 10);
+  h += F(" KB · PSRAM 空闲 "); h += String((unsigned long)(ESP.getFreePsram() >> 20));
+  h += F(" MB</li>");
+  h += F("<li>WiFi："); h += stateText(); h += F(" · IP "); h += ip();
+  if (WiFi.status() == WL_CONNECTED) {
+    h += F(" · RSSI "); h += String(WiFi.RSSI()); h += F(" dBm");
+  }
+  h += F("</li></ul>");
+
+  DbgInfo i = {};
+  if (onDbgInfo) onDbgInfo(i);
+
+  h += F("<h4>屏幕</h4><ul style='list-style:none;padding:0'>");
+  h += F("<li>模式："); h += i.mode; h += F("</li>");
+  h += F("<li>左屏：BUSY=");
+  h += i.busyL ? F("HIGH（空闲）") : F("LOW（忙/无应答）");
+  h += F(" · "); h += i.leftOk ? F("正常") : F("无响应（已降级，可复位）");
+  h += F("</li><li>右屏：BUSY=");
+  h += i.busyR ? F("HIGH（空闲）") : F("LOW（忙/无应答）");
+  h += F(" · "); h += i.rightOk ? F("正常") : F("无响应（已降级，可复位）");
+  h += F("</li>");
+  h += F("<li>上次刷新："); h += i.lastTag; h += F(" · "); h += String(i.lastMs);
+  h += F(" ms · "); h += i.lastOk ? F("ok") : F("BUSY 超时");
+  h += F(" · 累计 "); h += String((unsigned long)i.pageCount); h += F(" 次</li>");
+  h += F("<li>统计 fast：n="); h += String((unsigned long)i.fastN);
+  h += F(" avg="); h += String((unsigned long)i.fastAvg); h += F(" ms min=");
+  h += String((unsigned long)i.fastMin); h += F(" max=");
+  h += String((unsigned long)i.fastMax); h += F(" 超时=");
+  h += String((unsigned long)i.fastTo); h += F("</li>");
+  h += F("<li>统计 full：n="); h += String((unsigned long)i.fullN);
+  h += F(" avg="); h += String((unsigned long)i.fullAvg); h += F(" ms min=");
+  h += String((unsigned long)i.fullMin); h += F(" max=");
+  h += String((unsigned long)i.fullMax); h += F(" 超时=");
+  h += String((unsigned long)i.fullTo); h += F("</li></ul>");
+  h += F("<div class=row>");
+  h += dbgForm("resetL", "复位左屏");
+  h += dbgForm("resetR", "复位右屏");
+  h += dbgForm("refresh", "重画当前屏");
+  h += dbgForm("flipback", "上一对页");
+  h += dbgForm("flip", "下一对页");
+  h += F("</div>");
+
+  h += F("<h4>存储 / 书</h4><ul style='list-style:none;padding:0'>");
+  h += F("<li>SD：");
+  if (!i.sdOk) h += F("不可用");
+  else {
+    h += String(i.sdUsedMb); h += F(" / "); h += String(i.sdTotalMb); h += F(" MB");
+  }
+  h += F(" · 书库 "); h += String(i.libCount); h += F(" 本</li>");
+  h += F("<li>在读：");
+  if (i.bookOk) {
+    h += F("《"); h += i.bookName; h += F("》 p."); h += String(i.page);
+    if (i.pct >= 0) { h += F(" · "); h += String(i.pct); h += F("%"); }
+  } else h += F("无（demo 页）");
+  h += F("</li></ul>");
+
+  h += F("<h4>按键 / 霍尔</h4><ul style='list-style:none;padding:0'>");
+  h += F("<li>霍尔："); h += i.hallText; h += F("</li>");
+  h += F("<li>按键：去抖丢弃 "); h += String((unsigned long)i.keysBounce);
+  h += F(" · 队列溢出 "); h += String((unsigned long)i.keysOvf); h += F("</li></ul>");
+
+  h += F("<h4>串口日志 <span style='font-weight:normal'>"
+         "(滚动缓冲 · 2s 增量 · 与本地串口同一份)</span></h4>"
+         "<pre id=log style='height:22em;overflow:auto;background:#f4f4f4;"
+         "padding:.6em;font:12px/1.45 monospace;white-space:pre-wrap;"
+         "word-break:break-all'></pre>");
+  h += F("<div class=row>");
+  h += dbgForm("reboot", "重启设备", "return confirm('确定重启设备？')");
+  h += F("</div>");
+  h += F("<p><a href=/wifi>WiFi</a><a href=/upload>上传</a>"
+         "<a href=/library>书库</a><a href=/update>固件</a><a href=/>首页</a></p>");
+  // 日志轮询：since = 客户端游标（服务端 X-Seq 回执），textContent 追加不转义
+  h += F("<script>var seq=0,t=document.getElementById('log'),busy=false;"
+         "function poll(){if(busy)return;busy=true;var x=new XMLHttpRequest();"
+         "x.onload=function(){busy=false;if(x.responseText)t.textContent+=x.responseText;"
+         "seq=parseInt(x.getResponseHeader('X-Seq')||'0',10);t.scrollTop=t.scrollHeight;"
+         "if(t.textContent.length>60000)t.textContent=t.textContent.slice(-48000);};"
+         "x.onerror=function(){busy=false;};"
+         "x.open('GET','/debug/log?since='+seq);x.send();}"
+         "setInterval(poll,2000);poll();</script>");
+
+  String page = kHead;
+  page += F("<style>.row{display:flex;flex-wrap:wrap;gap:.4em}"
+            ".row form{flex:1 1 7em}input[type=hidden]{display:none}</style>");
+  page += h;
+  s_srv.send(200, "text/html; charset=utf-8", page);
+}
+
+void NetSvc::handleDebugLog() {
+  String out;
+  uint32_t since = (uint32_t)s_srv.arg("since").toInt();
+  uint32_t next = since;
+  DbgSerial.dump(out, since, next);
+  s_srv.sendHeader("X-Seq", String(next));
+  s_srv.send(200, "text/plain; charset=utf-8", out);
+}
+
+void NetSvc::handleDebugAct() {
+  String a = s_srv.arg("a");
+  if (a == "resetL" && onDbgPanel) onDbgPanel(true);
+  else if (a == "resetR" && onDbgPanel) onDbgPanel(false);
+  else if (a == "refresh" && onDbgRefresh) onDbgRefresh();
+  else if (a == "flip" && onDbgFlip) onDbgFlip(1);
+  else if (a == "flipback" && onDbgFlip) onDbgFlip(-1);
+  else if (a == "reboot") {
+    s_srv.send(200, "text/html; charset=utf-8",
+               String(kHead) + F("<p>重启中…（屏幕会全刷一次）</p>"));
+    Serial.println("[dbg] web: reboot requested");
+    m_restartAt = millis() + 1500;   // 响应发完再重启（loop 里到点执行）
+    return;
+  }
+  s_srv.sendHeader("Location", "/debug", true);
+  s_srv.send(302, "text/plain", "");
 }

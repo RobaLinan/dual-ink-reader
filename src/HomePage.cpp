@@ -77,7 +77,7 @@ void HomePage::drawLeft(const Ctx& ctx) {
   // 页脚：粗分隔线 + 居中提示
   drawThickRule(24, FOOT_RULE_Y, EinkPanel::PAGE_W - 24);
   drawCenteredUtf8(584, "Prev/Next 选择  Font 短按打开", EinkPanel::PAGE_W - 32);
-  drawCenteredUtf8(610, "Menu 短按主页  长按系统菜单", EinkPanel::PAGE_W - 32);
+  drawCenteredUtf8(610, "Font 长按删除  Menu 长按系统菜单", EinkPanel::PAGE_W - 32);
 }
 
 // ---- 右页：正在读 + 书库统计 + 按键说明 ----
@@ -120,15 +120,16 @@ void HomePage::drawRight(const Ctx& ctx) {
   // 按键说明
   drawThinRule(24, 310, EinkPanel::PAGE_W - 24);
   drawSectionHead(24, 322, "按键", 24);
-  static const char* kHint[6] = {
+  static const char* kHint[7] = {
     "Prev/Next  上下选择",
     "Font 短按  打开选中书",
+    "Font 长按  删除选中书",
     "选中当前书 = 直接回阅读页",
     "Menu 短按  回到本页（书页时）",
     "Menu 长按  系统菜单",
     "合盖深睡，开盖回上次状态",
   };
-  for (int i = 0; i < 6; i++)
+  for (int i = 0; i < 7; i++)
     drawUtf8(24, 358 + i * 26, kHint[i], EinkPanel::PAGE_W - 32);
 }
 

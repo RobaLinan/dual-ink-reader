@@ -6,6 +6,9 @@
 #include "TxtBook.h"
 #include "EpubZip.h"
 
+// 前向声明：目录解析遍历 tinyxml2 DOM（实现里才包含 tinyxml2 头）
+namespace tinyxml2 { class XMLElement; }
+
 // P4：EPUB 流式阅读（DESIGN §4 P4 行：miniz + tinyxml2 锁版本 + 书库 + 进度）。
 //
 // 架构 = "一章一转换"，复用 TxtBook 排版引擎，绝不整本常驻：
@@ -48,12 +51,34 @@ public:
   uint16_t chapterCount() const { return m_nChapters; }
   uint16_t currentChapter() const { return m_chapter; }
 
+  // —— 阅读功能（2026-10-12，见 Book.h 注释）——
+  uint16_t permille() override;
+  bool jumpPermille(uint16_t p) override;
+  int tocCount() override { return m_nToc ? m_nToc : m_nChapters; }
+  bool tocTitle(int idx, char* out, int n) override;
+  bool jumpToToc(int idx) override;
+
+  // zip 条目 → spine 章号（-1 = 不是章节；forEach 回调/目录匹配共用）
+  int chapterIndexOf(const char* zipPath) const;
+
 private:
   bool loadChapter(uint16_t idx);      // 解压+解析+抽文本+交给 TxtBook
   bool nextChapter();                  // 推进一章（读完回卷第一章）
-  bool parseOpf(const char* opfPath);  // 解析 OPF：标题/manifest/spine
+  bool parseOpf(const char* opfPath);  // 解析 OPF：标题/manifest/spine + 目录(NCX/nav)
   bool convertChapterToText(const char* docDir);  // XHTML 临时文件 → 纯文本临时文件
   bool extractWithRecovery(const char* zipPath, const char* outPath);  // 解压 + SD 读自救
+
+  // 目录（EPUB2 NCX / EPUB3 nav.xhtml；都没有 → tocCount 退化为"第N章"合成目录）
+  bool parseNcxToc(const char* zipPath, const char* baseDir);
+  bool parseNavToc(const char* zipPath, const char* baseDir);
+  void walkNcx(const tinyxml2::XMLElement* navPoint, const char* baseDir);
+  void walkNav(const tinyxml2::XMLElement* ol, const char* baseDir);
+  void addToc(uint16_t ch, const char* title);
+
+  // 进度%：spine 章权重（zip 条目解压尺寸）一次 O(N) 扫描惰性建表
+  bool ensureChSizes();
+  static void chSizeCb(const char* path, uint32_t size, void* ctx);
+  uint32_t estTotalPages();            // 按已渲染文本平均页字节估全书页数（页号用）
 
   // —— 插图（TxtBook 排版到图标记时回调；static trampoline 挂到 this）——
   bool measureImage(const char* zipPath, int maxW, int* outH);  // 探尺寸算占位行数
@@ -92,6 +117,16 @@ private:
   char m_imgPath[160] = "";            // 已解压进 TEMP_IMG 的 zip 路径（缓存键）
   bool m_imgCached = false;
   bool m_imgOk = false;
+
+  // —— 目录（parseOpf 末段填充；m_nToc=0 时 tocCount/tocTitle 退化"第N章"合成）——
+  uint16_t m_nToc = 0;                 // NCX/nav 解析出的目录条目数（≤ MAXCH）
+  uint16_t m_tocCh[MAXCH];             // 每条目录 → spine 章号（512B）
+  char* m_tocBuf = nullptr;            // PSRAM 标题行（MAXCH×48B），惰性分配
+
+  // —— 进度%权重（ensureChSizes 惰性一次建表）——
+  uint32_t m_chSize[MAXCH];            // 每章 zip 条目解压尺寸（权重，1KB）
+  uint32_t m_totalSize = 0;            // 权重总和
+  bool m_sizesOk = false;
 };
 
 #endif  // EPUB_BOOK_H

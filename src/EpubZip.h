@@ -32,6 +32,11 @@ public:
   // 条目原始大小（解压后），-1 = 无此条目
   long entrySize(const char* zipPath);
 
+  // 一次 O(N) 遍历中央目录：fn(条目路径, 解压后大小, ctx)，非目录条目。
+  // 用于建"章路径 → 大小"权重映射（进度%按 spine 章权重估算）；
+  // 按索引 stat 避免 locate_file 线性扫 × N 章的 O(N²) SD 往返。
+  bool forEach(void (*fn)(const char* path, uint32_t size, void* ctx), void* ctx);
+
 private:
   File m_file;
   bool m_ok = false;

@@ -33,6 +33,7 @@ public:
   void open(int curIdx, int count);  // 进主页：选中项落到当前读的那本
   void close() { m_open = false; }
   int selected() const { return m_sel; }
+  void select(int idx) { m_sel = idx; }   // 删书后恢复选中位置（draw 会越界夹取）
 
   Result move(int delta);            // Prev/Next 并批后的净位移（clamp 到库内）
   Result key(char c);                // 串口/Font 短按（' ' = 打开）

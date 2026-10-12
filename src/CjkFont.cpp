@@ -5,6 +5,8 @@
 #include <ESP32epdx.h>   // Paint_SetPixel / BLACK
 #include <string.h>
 #include <stdio.h>
+// 最后 include：Serial 重定向进日志环形缓冲（/debug 网页调试台，DESIGN §11）
+#include "DbgLog.h"
 
 CjkFont CJK;
 

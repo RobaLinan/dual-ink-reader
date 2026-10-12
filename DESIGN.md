@@ -517,7 +517,7 @@ SoftAP 配网页；OTA 开关同时管 ArduinoOTA（arduino-cli 网络上传）�
 | WiFi 配置 | `startPortal()`：热点 `eink-book-<MAC后4位>`（开放），手机连上开 `http://192.168.4.1/wifi` 扫描选 SSID 输密码 → 存 NVS → 重启连接 | `[热点]`/`[已配]`/`[未配]` |
 | WiFi 开关 | 射频总开关（`wifi` NVS 键，**默认关** = §2 省电定案；开且无凭据直接进配置热点） | `[开]`/`[关]` |
 | OTA 更新 | ArduinoOTA(3232, 无密码) + 网页 `/update`（传 **eink.ino.bin**，⚠️ 不是 merged.bin） | `[开]`/`[关]` |
-| 电子书上传服务 | 网页 `/upload`：`*.txt`/`*.epub` → SD `/books/`（重名覆盖），完成后回调 `onBookAdded` 重扫书库；覆盖正在读的书 → 关旧句柄重开、旧进度作废 | `[开]`/`[关]` |
+| 电子书上传服务 | 网页 `/upload`：`*.txt`/`*.epub` → SD `/books/`（重名覆盖），完成后回调 `onBookAdded` 重扫书库；`/library` 书库管理（下载/删除，删除回调 `onBookRemoved`，§10） | `[开]`/`[关]` |
 
 **导航**：`j`/`k`（或方向键序列尾字节 `A`/`B`）上下，`Enter`/空格执行，
 `q`/`m` 退出。**换行二义性定案**：紧跟命令字节的换行是尾字节（本项目
@@ -528,7 +528,8 @@ SoftAP 配网页；OTA 开关同时管 ArduinoOTA（arduino-cli 网络上传）�
 **网页路由**（单 WebServer:80 随 WiFi 开关整体起停）：
 `/` 状态索引 · `/wifi` 配置（内含阻塞扫描 1–3s，落在等待窗，翻页顺延）·
 `/wifi/save` 存 NVS + 延迟 1.5s 重启（响应先发完）· `/upload` 上传 ·
-`/update` 固件 OTA（`Update.begin/write/end`，OTA 关时收到上传直接拒绝不碰 Update）。
+`/update` 固件 OTA（`Update.begin/write/end`，OTA 关时收到上传直接拒绝不碰 Update）·
+`/debug` 调试台（状态/复位面板/日志尾巴，§11）。
 
 **关键机制**：
 - **NetSvc::loop() 只在 loop 等待窗被轮询**（5s 分片，20ms 一次）——上传/刷固件的
@@ -549,8 +550,8 @@ heap 余 244KB，WiFi 栈 ~45KB 无压力）。**硬件实测待做**：热点�
 
 ## 9. 选书主页与按键层级（2026-10-08 新增，src/HomePage.* + src/UiDraw.*）
 
-**需求**：要有一页能"选书"的主页；`Menu` **短按 = Home 键**（回主页）、
-**长按 250ms 才进系统菜单** —— 选书和设置分层，互不抢占短按。
+**需求**：要有一页能"选书"的主页；`Menu` **短按 = Home 键**（回主页）；
+**长按 250ms = 阅读菜单**（2026-10-12 前是系统菜单，见 §10）。
 
 **三层页面**（互斥显示，菜单可叠在主页之上，`g_home` 在菜单期间不清）：
 
@@ -558,7 +559,8 @@ heap 余 244KB，WiFi 栈 ~45KB 无压力）。**硬件实测待做**：热点�
 |---|---|---|---|
 | 书页 | 当前对页（自动/按键翻页） | 开机、打开选中书 | Menu 短按 → 主页 |
 | 主页 | 左页书库列表（`>` + 下划线 + `[在读]`）/ 右页正在读·书库统计·按键说明 | **Menu 短按**（全刷） | Font 短按打开选中书；串口 `n`/`q` 回书页 |
-| 系统菜单 | §8 四项设置 | **Menu 长按 250ms**（全刷） | Menu 短按 / `q` —— 按来源回主页或书页 |
+| 阅读菜单 | 本书书签/目录/进度/删书（§10） | **Menu 长按 250ms**（书页，全刷） | Menu 短按 / `q` 回书页 |
+| 系统菜单 | §8 四项设置 | **Menu 长按 250ms**（主页里）/ 阅读菜单"系统设置"项 | Menu 短按 / `q` —— 按来源回主页或书页 |
 
 **键位（`eink.ino keyAction()/drainKeys()`）**：
 - `Menu`：按下不表态，等 `LONG`（= 系统菜单）或 `RELEASE`（= 主页）分岔 ——
@@ -583,7 +585,118 @@ heap 余 244KB，WiFi 栈 ~45KB 无压力）。**硬件实测待做**：热点�
 （16 本 = 书库容量上限 → 末行 538）、页脚线 566 + 提示 584/610。
 
 **串口**：`n` 进/出主页，主页内 `j`/`k`（或方向尾字节 `A`/`B`）上下、
-空格/回车打开、`q` 回书页、`m` 系统菜单（换行尾字节 400ms 窗同 §8 定案）。
+空格/回车打开、`q` 回书页、`m` 系统菜单、`D` 删除选中书（换行尾字节 400ms 窗同 §8 定案）。
 
 **验收**：编译 997KB/76% 零警告（2026-10-08）。**屏上待验收**：Menu 短按回主页、
 长按进菜单、主页选书换书、睡前在主页开盖回主页。
+
+## 10. 阅读功能：书签 / 目录 / 进度% / 删书（2026-10-12 新增）
+
+对标 Kindle 的阅读功能层。数据与 UI 分两层：
+
+**数据层（Book 接口扩展，TxtBook / EpubBook 各自实现）**
+- `permille()` 全书进度千分比：TXT = 对页起点字节偏移/文件大小（精确）；
+  EPUB = spine 章权重（zip 条目解压尺寸，`EpubZip::forEach` 一次 O(N) 中央
+  目录遍历惰性建表，避免 locate_file 线性扫 × N 章的 O(N²) SD 往返）×
+  章内偏移/章文本大小比例换算。页眉显示 `p.N · 42%`（TxtBook::makeHeader，
+  EPUB 由 `EpubBook::renderPair` 注入全局值，`TxtBook::renderPair` 自行按字节
+  算——注意不能经 `permille()` 取，它优先返回注入值会自锁）。
+- `tocCount()/tocTitle()/jumpToToc()`：EPUB 解析 OPF 时顺带找目录源——
+  EPUB2 NCX（manifest media-type 含 dtbncx）→ `walkNcx` 递归 navPoint
+  （navLabel/text + content/src，`#fragment` 截掉后经 `resolveZipPath` 折叠
+  匹配 spine 章）；无 NCX 再试 EPUB3 nav.xhtml（properties=nav）→ `walkNav`
+  递归 ol/li/a。两者都无 → 退化"第N章"合成目录（tocCount 返回章数）。
+  TXT = 启发式扫章：行首 `第X章/回/节/卷/部/篇`（X 限数字与中文数字）、
+  `Chapter N`、整行短词（序章/前言/楔子/尾声/后记…，≤78B 行），独立句柄
+  流式扫（不碰排版游标），结果缓存片内 LittleFS（键 = 路径 FNV-1a 哈希，
+  失效键 = 书文件大小）。主机端验证：26 例标题判定全过；三本书 NCX 匹配
+  alice 6/6、carol 24/24 全命中。
+- `jumpPermille(p)`：EPUB 按章权重选章（权重 0 的章自然跳过）→ loadChapter
+  → 章内偏移 = 目标在章权重区间内的比例 × 章文本大小（TxtBook::seekTo 对准
+  UTF-8 边界）；TXT 直接字节偏移。页号按已渲染页平均字节数估算
+  （`m_avgNum/m_avgDen`，renderPage 累计）——跳转后页眉 p.N 是估计值，
+  % 是精确的，对页对齐（偶数）。
+
+**UI 层（src/ListPage.* 通用滚动列表 + src/Bookmarks.* NVS 书签）**
+- ListPage：左页标题+可滚动选中列表（>16 项滚窗，版式同主页），右页
+  "当前"信息 + "操作"说明（支持按项两行 hints）；`menuList` = 阅读菜单
+  （7 项：添加书签/书签列表/目录跳转/跳到进度/删除本书/系统设置/返回），
+  `subList` = 子列表（书签/目录/进度三选一，`g_subMode` 区分），可叠放。
+- 书签 = `BmLoc{off,page,ch,permille}`，坐标语义与进度存档/对页历史栈
+  一致（`restoreAt` 直接可用）；NVS "eink-book" 空间 blob 存储
+  （key = `bm`+FNV-1a(路径)，每书 16 条上限，192B）——选 NVS 是因为坑 18
+  定案 SD 写入物理锁卡，书签这种高频小写绝不碰 SD。
+- 键位变更（WIRING §3.4 已同步）：**书页 Menu 长按 = 阅读菜单**（原系统菜
+  单挪到主页长按 + 阅读菜单"系统设置"项）；**主页 Font 长按 = 删除选中书**
+  （确认屏：Font 短按 = 确认 / 其他任何键 = 取消）；阅读菜单/子列表内
+  Prev/Next 选择、Font 短按执行、Menu 退出。跳转（书签/目录/进度）前把
+  当前对页压历史栈 → Prev 可一步步跳回跳转前位置。
+- 串口：`M` 阅读菜单、`k` 直接加书签、`t`/`T` 直达目录/进度（不开菜单）、
+  `D` 删当前书（确认屏 `y`/空格确认）。
+- 深睡：屏上非书页（阅读菜单/子列表/确认屏）与系统菜单同记账
+  （`s_sleepMenu`），开盖走全刷回书页。
+- 删书内核 `removeBookByPath`（按键确认屏与网页 /library/del 共用）：
+  清 NVS 书签 + 指向本书的单槽进度 → SD remove → 重扫 → 删的是在读那本
+  则顺位开下一本可读的书（从第 0 对页起）。
+
+**网页（NetSvc 扩展，与 /upload 共用"电子书上传服务"开关）**
+- `/library`：书库列表（大小/SD 用量）+ 每本 **下载**（streamFile，
+  filename* UTF-8）/ **删除**（JS confirm + XHR POST → `onBookRemoved`
+  回调走删书内核）。
+- `/upload` 与 `/update` 表单改 **XHR 上传 + 实时进度条**（原生 form POST
+  浏览器只给转圈）：百分比 / 已传 MB / 速率；服务端 512B 单块写与 OTA 流程
+  不变。
+
+**验收**：编译 1022KB/3MB（32%）零警告；标题判定 26 例主机端全过；
+NCX 匹配主机端镜像验证全命中；rot_layout_test 离屏回归通过。
+**屏上待验收**：阅读菜单四项全流程、书签跳回、TXT 目录扫描耗时与命中率、
+EPUB 章权重建表的开书耗时、网页 /library 删书与下载、上传进度条、
+跳转后 Prev 回退、深睡时开着阅读菜单开盖恢复。
+
+## 11. 网页调试台 /debug + 面板降级（2026-10-12 新增，src/DbgLog.*）
+
+**需求**：现场"左屏没有响应，网页都打不开了"——根因是 `setup()` 里
+`left.begin()` 失败走 `while(1) delay(1000)` FATAL 卡死：loop 永不运行 →
+`net.loop()`（handleClient）永不轮询 → WebServer 接受了连接也永远不应答。
+屏幕一挂，唯一线索只剩串口。**原则：屏幕是外设不是命门** —— 任何一块屏
+（甚至两块全）挂掉，WiFi/OTA/网页/串口必须全部照常活着。
+
+**面板降级（eink.ino）**：
+- 开机：`left.begin()`/`right.begin()` 结果分别记 `g_leftOk`/`g_rightOk`，
+  不再有任何 FATAL 卡死路径（framebuffer 分配失败除外——没显存什么都画不了）。
+  失败组合：单左 / 单右 / **无头** 三种退化模式，刷新路径只碰活着的屏。
+- 运行期：连续 `PANEL_STRIKES=3` 次 BUSY 超时且探针（`idle()`）显示该屏
+  BUSY 仍没拉高 → 判死降级（`strikePanel()`），从刷新路径摘出去；成功刷新
+  即清零计数（瞬态干扰不冤枉屏）。两屏都死 → 无头模式，刷新不再碰 SPI，
+  也就不再每轮白烧 8s 超时。
+- **无头救砖通道**：两屏都挂时 `net.startPortal()` 自动开配置热点（屏幕菜单
+  已经全没了，这是唯一入口）——手机连上 `eink-book-xxxx` 热点开
+  `http://192.168.4.1/debug` 即可远程诊断。会把 `wifi` NVS 置开（救砖场景
+  可接受，正常路径不触发）。
+
+**串口日志镜像（src/DbgLog.h/.cpp）**：`#define Serial DbgSerial` 宏重定向 ——
+include "DbgLog.h"（各 .cpp 放**最后一条 include**，库头先展开，库自己的 .cpp
+是独立编译单元不经宏）之后，本编译单元所有 `Serial.*` 走 `DbgSerialProxy`：
+一份原样转发真 UART0（本地串口照旧），一份带 `[ms]` 行时间戳进 **PSRAM 32KB
+环形缓冲**。`DbgLog.cpp` 在宏生效前抓 `&Serial` 指针，转发不自递归。`if
+(Serial)` 恒真、`available/read/peek/flush` 直通 —— 收割验证等读口行为不变。
+
+**网页路由（NetSvc 扩展，不挂任何服务开关——WiFi 开着就能用）**：
+- `/debug`：设备（运行时长 / **复位原因**（崩溃还是上电一眼定位）/ 固件编译
+  时间戳 / heap+最低水位 / PSRAM / WiFi+RSSI）、屏幕（模式 / 左右 BUSY 电平 /
+  存活状态 / 上次刷新耗时 / fast+full 统计）、存储（SD 用量 / 书库 / 在读页与
+  进度%）、按键（去抖丢弃 / 队列溢出）+ 动作按钮：**复位左/右屏**（`begin()`
+  重 init + 硬复位，RST 脉冲救卡在 BUSY 的屏）/ **重画当前屏**（按 UI 上下文
+  分发，不顶掉菜单帧）/ **上·下一对页** / **重启设备**。
+- `/debug/log?since=N`：日志环增量（text/plain 原样字节，客户端 textContent
+  追加不转义；单次 ≤8KB 头裁 + "已滚出"标记；游标 = 累计字节数，响应头
+  `X-Seq` 回执；页面 2s 轮询 = 远程实时串口尾巴）。
+- `/debug/act`（POST a=resetL|resetR|refresh|flip|flipback|reboot）：
+  302 回 /debug；reboot 走既有 `m_restartAt` 延迟重启（响应先发完）。
+- 设备侧状态一律经 `net.onDbgInfo` 回调从 eink.ino 注入（NetSvc 不猜硬件），
+  动作回调与 `onBookAdded` 同在 loop 等待窗上下文执行，可以安全刷屏。
+
+**验收**：编译 1033KB/3MB（32%）零警告。**屏上/网页待验收**：拔左屏上电
+→ 进单右屏模式且热点/网页可达；/debug 显示 BUSY 电平与复位原因；复位面板
+按钮救回卡 BUSY 的屏；/debug/log 与本地串口内容一致；两屏全拔 → 自动热点
+救砖通道可达。

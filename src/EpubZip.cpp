@@ -2,6 +2,8 @@
 #include "Storage.h"
 #include "SD_MMC.h"
 #include "miniz/miniz.h"
+// 最后 include：Serial 重定向进日志环形缓冲（/debug 网页调试台，DESIGN §11）
+#include "DbgLog.h"
 
 // ===== miniz 32 位堆越界缓解（永久修复，上游 richgel999/miniz#371）=====
 // xtensa 32 位目标上 tinfl_decompress 会写越 tinfl_decompressor 结构体尾部（64 位
@@ -79,6 +81,20 @@ long EpubZip::entrySize(const char* zipPath) {
   if (idx < 0) return -1;
   if (!mz_zip_reader_file_stat((mz_zip_archive*)m_zip, idx, &st)) return -1;
   return (long)st.m_uncomp_size;
+}
+
+bool EpubZip::forEach(void (*fn)(const char* path, uint32_t size, void* ctx),
+                      void* ctx) {
+  if (!m_ok || !fn) return false;
+  mz_zip_archive* zip = (mz_zip_archive*)m_zip;
+  mz_uint n = mz_zip_reader_get_num_files(zip);
+  for (mz_uint i = 0; i < n; i++) {
+    mz_zip_archive_file_stat st;
+    if (!mz_zip_reader_file_stat(zip, i, &st)) continue;
+    if (st.m_is_directory) continue;
+    fn(st.m_filename, (uint32_t)st.m_uncomp_size, ctx);
+  }
+  return true;
 }
 
 // 解压条目 → 调用方指定 FS（EPUB 用片内 LittleFS）上的临时文件。

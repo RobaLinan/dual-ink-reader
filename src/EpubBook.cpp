@@ -12,6 +12,8 @@
 
 #define TIXML2_PSRAM_POOL          // tinyxml2 池块走 PSRAM（补丁见 VENDOR.md）
 #include "tinyxml2/tinyxml2.h"
+// 最后 include：Serial 重定向进日志环形缓冲（/debug 网页调试台，DESIGN §11）
+#include "DbgLog.h"
 
 using namespace tinyxml2;
 
@@ -32,6 +34,7 @@ static const char* TEMP_OPF       = "/__o.opf";
 static const char* TEMP_XHTML     = "/__e.xhtml";
 static const char* TEMP_TXT       = "/__e.txt";
 static const char* TEMP_IMG       = "/__i.bin";   // 插图（解压到渲染同一张时复用）
+static const char* TEMP_NCX       = "/__t.ncx";   // 目录源（NCX 或 nav.xhtml 共用）
 
 // ---- 文本汇：DOM 遍历 → LittleFS 临时文本，顺手做空白规范化 ----
 // XHTML 源码里缩进/换行全是排版噪音；规则：折叠空白为单空格、块级元素补 '\n'、
@@ -102,24 +105,19 @@ static bool isBlockTag(const char* n) {
 // percentDecode 定义在本文件后部，先给原型（emitImageMarker 只在转换路径被调）
 static void percentDecode(char* s);
 
-// TxtBook 排版时认这行标记、量高占位、回调 EpubBook 解码绘制（白底 1bit 抖动）。
-// 路径处理：相对本章 XHTML（docDir 含尾 '/'）→ '../' 折叠（EPUB 图常放兄弟目录，
-// 如 OEBPS/text/ch1.xhtml 引 ../images/pic.png）→ '#锚' 截掉 → %XX 解码。
-// 路径里空格转 %20：空格会拆词，标记必须作为一个完整"词"过 TxtBook 的词缓冲。
-static void emitImageMarker(TextSink& sink, const char* docDir, const char* src) {
-  if (strncmp(src, "data:", 5) == 0 || strncmp(src, "http", 4) == 0) return;
-
-  char tmp[160];
+// 解析相对 href → 规范化 zip 内路径（'#' 锚截掉、./ 与 ../ 折叠、%XX 解码）。
+// 与 emitImageMarker 同一套规则，目录 NCX/nav 的 content src / a href 复用。
+static void resolveZipPath(char* out, size_t n, const char* baseDir, const char* src) {
   if (src[0] == '/')
-    snprintf(tmp, sizeof(tmp), "%s", src + 1);   // zip 根开头的 '/' 去掉
+    snprintf(out, n, "%s", src + 1);   // zip 根开头的 '/' 去掉
   else
-    snprintf(tmp, sizeof(tmp), "%s%s", docDir, src);
-  char* frag = strchr(tmp, '#');
+    snprintf(out, n, "%s%s", baseDir, src);
+  char* frag = strchr(out, '#');
   if (frag) *frag = '\0';
 
   // 折叠 ./ 和 ../：段指针栈，原地把 '/' 换 '\0'
   char* seg[24]; int ns = 0;
-  for (char* p = tmp; *p && ns < 24; ) {
+  for (char* p = out; *p && ns < 24; ) {
     while (*p == '/') p++;
     if (!*p) break;
     char* start = p;
@@ -135,8 +133,19 @@ static void emitImageMarker(TextSink& sink, const char* docDir, const char* src)
     if (path[0]) strncat(path, "/", sizeof(path) - strlen(path) - 1);
     strncat(path, seg[i], sizeof(path) - strlen(path) - 1);
   }
-  if (!path[0]) return;
-  percentDecode(path);
+  snprintf(out, n, "%s", path);
+  percentDecode(out);
+}
+
+// TxtBook 排版时认这行标记、量高占位、回调 EpubBook 解码绘制（白底 1bit 抖动）。
+// 路径处理：相对本章 XHTML（docDir 含尾 '/'）→ '../' 折叠（EPUB 图常放兄弟目录，
+// 如 OEBPS/text/ch1.xhtml 引 ../images/pic.png）→ '#锚' 截掉 → %XX 解码。
+// 路径里空格转 %20：空格会拆词，标记必须作为一个完整"词"过 TxtBook 的词缓冲。
+static void emitImageMarker(TextSink& sink, const char* docDir, const char* src) {
+  if (strncmp(src, "data:", 5) == 0 || strncmp(src, "http", 4) == 0) return;
+
+  char path[160];
+  resolveZipPath(path, sizeof(path), docDir, src);
   if (!path[0]) return;
 
   sink.nl();
@@ -267,6 +276,9 @@ bool EpubBook::open(const char* path) {
   m_chapterDone = false;
   m_chapter = 0;
   m_nChapters = 0;
+  m_nToc = 0;
+  m_sizesOk = false;
+  m_totalSize = 0;
   m_page = 0;
   m_pairStart = -1;
   m_opfDir[0] = '\0';
@@ -438,7 +450,7 @@ bool EpubBook::parseOpf(const char* opfPath) {
   }
 
   // manifest：href 按 id 暂存（id ≤31B，href ≤63B，章书足够）
-  struct Man { char id[32]; char href[64]; bool html; };
+  struct Man { char id[32]; char href[64]; bool html; bool ncx; bool nav; };
   static Man man[128];
   int nman = 0;
   if (const XMLElement* mf = root->FirstChildElement("manifest")) {
@@ -451,6 +463,9 @@ bool EpubBook::parseOpf(const char* opfPath) {
       snprintf(man[nman].id, sizeof(man[nman].id), "%s", id);
       snprintf(man[nman].href, sizeof(man[nman].href), "%s", href);
       man[nman].html = (strstr(mt, "xhtml") != NULL || strstr(mt, "html") != NULL);
+      man[nman].ncx = (strstr(mt, "dtbncx") != NULL);   // EPUB2 目录
+      const char* props = it->Attribute("properties");
+      man[nman].nav = (props && strstr(props, "nav") != NULL);  // EPUB3 目录
       nman++;
     }
   }
@@ -475,6 +490,22 @@ bool EpubBook::parseOpf(const char* opfPath) {
       }
     }
   }
+
+  // 目录：EPUB2 用 NCX（media-type dtbncx），EPUB3 用 nav.xhtml（properties=nav）；
+  // 都没有 → m_nToc 保持 0，tocCount/tocTitle 退化"第N章"合成目录。
+  m_nToc = 0;
+  for (int i = 0; i < nman; i++) {
+    if (!man[i].ncx) continue;
+    if (parseNcxToc(man[i].href, m_opfDir)) break;
+  }
+  if (!m_nToc) {
+    for (int i = 0; i < nman; i++) {
+      if (!man[i].nav) continue;
+      if (parseNavToc(man[i].href, m_opfDir)) break;
+    }
+  }
+  if (m_nToc) Serial.printf("[epub] toc: %u entries\n", (unsigned)m_nToc);
+
   free(buf);
   return true;
 }
@@ -623,6 +654,7 @@ bool EpubBook::renderPair(uint8_t* fbL, uint8_t* fbR) {
   m_pairStartCh = m_chapter;
   m_pairStart = m_txt.curFilePos();
   m_pairStartPage = m_page;
+  m_txt.setPermille((int)permille());   // 页眉进度% = 全局（章权重+章内偏移）
 
   // 左页。空章（转换失败/无文本）连续跳过，全坏则书不可用
   bool okL = m_txt.renderPage(fbL, m_page);
@@ -669,4 +701,250 @@ bool EpubBook::restorePair(uint16_t ch, long off, uint32_t page) {
   m_pairStartPage = page;
   m_pairStartCh = m_chapter;
   return m_txt.restorePair(off, page);
+}
+
+// ==== 阅读功能（2026-10-12：目录/进度%/跳转）================================
+
+int EpubBook::chapterIndexOf(const char* zipPath) const {
+  for (uint16_t i = 0; i < m_nChapters; i++)
+    if (strcmp(m_chapterPath[i], zipPath) == 0) return (int)i;
+  return -1;
+}
+
+void EpubBook::addToc(uint16_t ch, const char* title) {
+  if (m_nToc >= MAXCH || ch >= m_nChapters) return;
+  if (!m_tocBuf) {                       // 惰性分配（PSRAM 12KB，失败则不用真实目录）
+    m_tocBuf = (char*)ps_malloc((size_t)MAXCH * 48);
+    if (!m_tocBuf) { Serial.println("WARN: toc buffer alloc failed"); return; }
+  }
+  m_tocCh[m_nToc] = ch;
+  snprintf(m_tocBuf + (size_t)m_nToc * 48, 48, "%s", title ? title : "");
+  m_nToc++;
+}
+
+// 目录源路径的基目录（含尾 '/'；无目录 → 空串 = zip 根）
+static void dirOf(const char* zipPath, char* out, size_t n) {
+  const char* slash = strrchr(zipPath, '/');
+  if (!slash) { out[0] = '\0'; return; }
+  size_t len = (size_t)(slash - zipPath) + 1;
+  if (len >= n) len = n - 1;
+  memcpy(out, zipPath, len);
+  out[len] = '\0';
+}
+
+bool EpubBook::parseNcxToc(const char* href, const char* opfDir) {
+  char zp[96];
+  resolveZipPath(zp, sizeof(zp), opfDir, href);
+  if (!extractWithRecovery(zp, TEMP_NCX)) return false;
+  char* buf = readFileToPsram(tempFs(), TEMP_NCX, NULL);
+  tempFs().remove(TEMP_NCX);
+  if (!buf) return false;
+  XMLDocument doc;
+  if (doc.Parse(buf) != XML_SUCCESS) { free(buf); return false; }
+  const XMLElement* nm = doc.FirstChildElement("ncx");
+  if (!nm) nm = doc.RootElement();
+  char base[64];
+  dirOf(zp, base, sizeof(base));
+  if (nm) {
+    if (const XMLElement* nmap = nm->FirstChildElement("navMap"))
+      walkNcx(nmap, base);
+  }
+  free(buf);
+  return m_nToc > 0;
+}
+
+void EpubBook::walkNcx(const tinyxml2::XMLElement* np, const char* baseDir) {
+  for (const XMLElement* c = np->FirstChildElement("navPoint"); c;
+       c = c->NextSiblingElement("navPoint")) {
+    char tbuf[48] = "";
+    if (const XMLElement* nl = c->FirstChildElement("navLabel"))
+      if (const XMLElement* tx = nl->FirstChildElement("text"))
+        if (tx->GetText()) snprintf(tbuf, sizeof(tbuf), "%s", tx->GetText());
+    if (const XMLElement* ct = c->FirstChildElement("content")) {
+      const char* src = ct->Attribute("src");
+      if (src) {
+        char zp[160];
+        resolveZipPath(zp, sizeof(zp), baseDir, src);
+        int ch = chapterIndexOf(zp);
+        if (ch >= 0) addToc((uint16_t)ch, tbuf);
+      }
+    }
+    walkNcx(c, baseDir);   // 嵌套 navPoint（子章节）
+  }
+}
+
+bool EpubBook::parseNavToc(const char* href, const char* opfDir) {
+  char zp[96];
+  resolveZipPath(zp, sizeof(zp), opfDir, href);
+  if (!extractWithRecovery(zp, TEMP_NCX)) return false;
+  char* buf = readFileToPsram(tempFs(), TEMP_NCX, NULL);
+  tempFs().remove(TEMP_NCX);
+  if (!buf) return false;
+  XMLDocument doc;
+  if (doc.Parse(buf) != XML_SUCCESS) { free(buf); return false; }
+  char base[64];
+  dirOf(zp, base, sizeof(base));
+  const XMLElement* root = doc.RootElement();
+  // 找目录 nav：epub:type="toc"；没有则退第一个含 <ol> 的 <nav>
+  const XMLElement* nav = nullptr;
+  for (const XMLElement* e = root ? root->FirstChildElement() : nullptr; e;
+       e = e->NextSiblingElement()) {
+    if (strcmp(e->Name(), "nav") != 0) continue;
+    const char* t = e->Attribute("epub:type");
+    if (t && strcmp(t, "toc") == 0) { nav = e; break; }
+    if (!nav && e->FirstChildElement("ol")) nav = e;
+  }
+  // body 里再兜一层（nav 可能在 body 下，上面只扫了顶层兄弟）
+  if (!nav && root) {
+    for (const XMLElement* e = root->FirstChildElement(); e && !nav;
+         e = e->NextSiblingElement()) {
+      if (strcmp(e->Name(), "body") != 0) continue;
+      for (const XMLElement* b = e->FirstChildElement(); b; b = b->NextSiblingElement()) {
+        if (strcmp(b->Name(), "nav") != 0) continue;
+        const char* t = b->Attribute("epub:type");
+        if ((t && strcmp(t, "toc") == 0) || b->FirstChildElement("ol")) { nav = b; break; }
+      }
+    }
+  }
+  if (nav) {
+    if (const XMLElement* ol = nav->FirstChildElement("ol")) walkNav(ol, base);
+  }
+  free(buf);
+  return m_nToc > 0;
+}
+
+void EpubBook::walkNav(const tinyxml2::XMLElement* ol, const char* baseDir) {
+  for (const XMLElement* li = ol->FirstChildElement("li"); li;
+       li = li->NextSiblingElement("li")) {
+    if (const XMLElement* a = li->FirstChildElement("a")) {
+      const char* href = a->Attribute("href");
+      if (href) {
+        char zp[160];
+        resolveZipPath(zp, sizeof(zp), baseDir, href);
+        int ch = chapterIndexOf(zp);
+        if (ch >= 0) addToc((uint16_t)ch, a->GetText());
+      }
+    }
+    if (const XMLElement* sub = li->FirstChildElement("ol")) walkNav(sub, baseDir);
+  }
+}
+
+bool EpubBook::tocTitle(int idx, char* out, int n) {
+  if (!out || n <= 0 || idx < 0 || idx >= tocCount()) return false;
+  if (m_nToc) {
+    snprintf(out, n, "%s", m_tocBuf + (size_t)idx * 48);
+    if (!out[0]) snprintf(out, n, "第%u章", (unsigned)m_tocCh[idx] + 1);  // 空标题兜底
+  } else {
+    snprintf(out, n, "第%u章", (unsigned)idx + 1);   // 合成目录（无 NCX/nav 的书）
+  }
+  return true;
+}
+
+// 章权重一次建表：O(N) 遍历中央目录（file_stat 按索引），章路径命中 spine 记权重。
+// 权重 = 章 XHTML 解压尺寸（∝ 文本量），进度%与按%跳转选章都用它。
+void EpubBook::chSizeCb(const char* path, uint32_t size, void* ctx) {
+  EpubBook* self = (EpubBook*)ctx;
+  int ch = self->chapterIndexOf(path);
+  if (ch >= 0 && self->m_chSize[ch] == 0) {
+    self->m_chSize[ch] = size;
+    self->m_totalSize += size;
+  }
+}
+
+bool EpubBook::ensureChSizes() {
+  if (m_sizesOk) return true;
+  memset(m_chSize, 0, sizeof(m_chSize));
+  m_totalSize = 0;
+  m_zip.forEach(chSizeCb, this);
+  m_sizesOk = true;
+  return m_totalSize > 0;
+}
+
+// 全书进度千分比 = (前面章权重和 + 本章权重 × 章内偏移/章文本大小) / 总权重。
+// 章内偏移→文本比例换算用本章临时文本大小（XHTML 尺寸≠文本尺寸，比例换算抵消）。
+uint16_t EpubBook::permille() {
+  if (!m_ok) return 0xFFFF;
+  if (!ensureChSizes() || !m_totalSize) return 0xFFFF;
+  uint32_t cum = 0;
+  for (uint16_t i = 0; i < m_chapter && i < m_nChapters; i++) cum += m_chSize[i];
+  uint64_t numer = (uint64_t)cum * 1000;
+  uint32_t ts = (uint32_t)m_txt.textSize();
+  uint32_t cs = m_chSize[m_chapter];
+  if (cs && ts > 1 && m_pairStart > 0)
+    numer += (uint64_t)m_pairStart * 1000 * cs / ts;
+  uint32_t p = (uint32_t)(numer / m_totalSize);
+  return p > 1000 ? 1000 : (uint16_t)p;
+}
+
+// 全书页数估计：总文本量（权重 × 当前章 文本/权重 比例）/ 平均文本页字节。
+// 页号只是显示参考（% 是精确的），跳转后页眉 p.N 为估计值。
+uint32_t EpubBook::estTotalPages() {
+  ensureChSizes();
+  uint32_t num, den;
+  m_txt.avgBytes(&num, &den);
+  if (!num || !den || !m_totalSize) return (uint32_t)m_nChapters * 10;
+  uint32_t ts = (uint32_t)m_txt.textSize();
+  uint32_t cs = m_chSize[m_chapter];
+  uint64_t totalText = (cs && ts) ? (uint64_t)m_totalSize * ts / cs : m_totalSize;
+  uint32_t tp = (uint32_t)(totalText * den / num);
+  return tp ? tp : 1;
+}
+
+bool EpubBook::jumpPermille(uint16_t p) {
+  if (!m_ok) return false;
+  if (!ensureChSizes() || !m_totalSize) return false;
+  uint64_t target = (uint64_t)p * m_totalSize / 1000;
+  uint32_t cum = 0;
+  uint16_t ch = m_nChapters - 1;
+  for (uint16_t i = 0; i < m_nChapters; i++) {
+    if (cum + m_chSize[i] > target || i == m_nChapters - 1) { ch = i; break; }
+    cum += m_chSize[i];
+  }
+  if (!loadChapter(ch)) return false;
+  m_chapterDone = false;
+  long ts = m_txt.textSize();
+  long off = 0;
+  if (m_chSize[ch] && ts > 1) {          // 章内定位：目标在章权重区间内的比例 → 文本偏移
+    uint64_t into = target - cum;
+    off = (long)(into * (uint64_t)ts / m_chSize[ch]);
+    if (off >= ts) off = ts - 1;
+  }
+  if (!m_txt.seekTo(off)) return false;
+  m_page = (uint32_t)((uint64_t)p * estTotalPages() / 1000) & ~1u;
+  m_pairStart = m_txt.curFilePos();
+  m_pairStartPage = m_page;
+  m_pairStartCh = m_chapter;
+  m_txt.setPermille((int)permille());
+  Serial.printf("[epub] jump to %u%% -> ch%u off %ld\n", (unsigned)p / 10,
+                (unsigned)m_chapter + 1, m_pairStart);
+  return true;
+}
+
+bool EpubBook::jumpToToc(int idx) {
+  if (!m_ok) return false;
+  uint16_t ch;
+  if (m_nToc) {
+    if (idx < 0 || idx >= m_nToc) return false;
+    ch = m_tocCh[idx];
+  } else {
+    if (idx < 0 || idx >= m_nChapters) return false;
+    ch = (uint16_t)idx;                  // 合成目录 = 章号直跳
+  }
+  if (ch >= m_nChapters || !loadChapter(ch)) return false;
+  m_chapterDone = false;
+  // 页号估计：章首的进度% × 全书估计页数
+  ensureChSizes();
+  uint16_t p = 0;
+  if (m_totalSize) {
+    uint32_t cum = 0;
+    for (uint16_t i = 0; i < ch; i++) cum += m_chSize[i];
+    p = (uint16_t)((uint64_t)cum * 1000 / m_totalSize);
+  }
+  m_page = (uint32_t)((uint64_t)p * estTotalPages() / 1000) & ~1u;
+  m_txt.restorePair(0, m_page);
+  m_pairStart = 0;
+  m_pairStartPage = m_page;
+  m_pairStartCh = m_chapter;
+  m_txt.setPermille((int)permille());
+  return true;
 }

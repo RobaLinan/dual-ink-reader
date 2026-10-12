@@ -9,7 +9,9 @@
 //               网页里扫描/选 SSID 输密码，存 NVS 后重启连接）
 //   WiFi 开关 = 射频总开关（NVS 持久化，**默认关** = 设计 §2 "WiFi 默认关" 省电）
 //   OTA 开关   = ArduinoOTA（arduino-cli 网络上传）+ 网页 /update 传 .bin，同一开关
-//   上传服务   = 网页 /upload 上传 *.txt/*.epub → SD /books/，写完回调 onBookAdded
+//   上传服务   = 网页 /upload 上传 *.txt/*.epub → SD /books/，写完回调 onBookAdded；
+//                /library 书库管理（列表/下载/删除），删完回调 onBookRemoved。
+//                两个页面共用"电子书上传服务"开关（= 网页书库服务总开关）。
 //
 // 单 WebServer(:80) 承载全部页面，随 WiFi 开关整体起停；所有方法只在 loop 等待窗
 // 被轮询（NetSvc::loop），不碰屏 SPI —— 上传/OTA 的闪存写都落在翻页间隙，
@@ -43,6 +45,37 @@ public:
 
   // 上传完成回调：path 已写入 SD /books（.ino 里重扫书库/重开当前书）
   void (*onBookAdded)(const char* path) = nullptr;
+  // 网页删除回调：path 已从 SD 删除（.ino 里清书签/进度、重扫、必要时换书）
+  void (*onBookRemoved)(const char* path) = nullptr;
+
+  // ---- /debug 网页调试台（DESIGN §11）：设备侧状态注入 + 动作回调 ----
+  // 屏幕全挂时的救砖通道：状态经 onDbgInfo 从 eink.ino 注入；动作回调在 loop
+  // 等待窗上下文执行（与 onBookAdded 同上下文，可以安全刷屏）。WiFi 开关是这页
+  // 的门槛（深睡关 WiFi 时网页本就不可达，属 §2 设计）
+  struct DbgInfo {
+    const char* mode;       // 显示模式："双屏"/"仅左屏"/"仅右屏"/"无头"
+    bool leftOk, rightOk;   // 面板存活（开机 begin 结果 + 运行期超时降级）
+    int busyL, busyR;       // BUSY 引脚电平（HIGH = 空闲）
+    const char* hallText;   // 霍尔："开盖"/"合盖"（极性由 eink.ino 解释）
+    uint32_t pageCount;     // 累计刷新次数
+    uint32_t lastMs;        // 上次刷新耗时
+    bool lastOk;            // 上次刷新是否 BUSY 超时
+    const char* lastTag;    // 上次刷新来源（fast/menu/home…）
+    uint32_t fastN, fastAvg, fastMin, fastMax, fastTo;   // PageStats 汇总
+    uint32_t fullN, fullAvg, fullMin, fullMax, fullTo;
+    int libCount;           // 书库本数
+    bool bookOk;            // 有在读的书
+    const char* bookName;   // 当前书名（"-" = 无书）
+    long page;              // 当前对页号（-1 = 无书）
+    int pct;                // 进度%（-1 = 未知）
+    bool sdOk;              // SD 挂载成功
+    unsigned long sdUsedMb, sdTotalMb;
+    uint32_t keysBounce, keysOvf;   // 按键去抖丢弃 / 队列溢出（诊断）
+  };
+  void (*onDbgInfo)(DbgInfo&) = nullptr;   // GET /debug 时填状态
+  void (*onDbgPanel)(bool left) = nullptr; // 复位某屏（硬复位 + 重新 init）
+  void (*onDbgRefresh)() = nullptr;        // 强制重画当前屏（按 UI 上下文）
+  void (*onDbgFlip)(int delta) = nullptr;  // 翻页测试（±1 对页）
 
 private:
   void setupHttp();
@@ -61,6 +94,12 @@ private:
   void handleUpdateForm();
   void handleUpdateResult();
   void updateChunk();
+  void handleLibrary();                       // /library：书库列表/下载/删除
+  void handleLibraryDel();
+  void handleLibraryGet();
+  void handleDebug();                         // /debug：调试台（状态+动作+日志）
+  void handleDebugLog();                      // /debug/log：日志环增量（text/plain）
+  void handleDebugAct();                      // /debug/act：复位面板/刷新/翻页/重启
 
   bool m_wifiOn = false;   // NVS 默认 false（省电）
   bool m_otaOn = true;     // NVS 默认 true：WiFi 一开即可 OTA（开关语义直观）

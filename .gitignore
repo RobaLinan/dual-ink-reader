@@ -5,3 +5,6 @@ __pycache__/
 # PCB 导出/备份（不入库）
 PCB/*.zip
 PCB/*_backup/
+
+# CAD 自动备份（不入库）
+*.FCBak

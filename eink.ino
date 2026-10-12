@@ -22,18 +22,30 @@
 // WiFi 配置（热点配网页）/ WiFi 开关 / OTA 开关 / 网页上传电子书；
 // 菜单开着暂停自动翻页，合盖仍深睡（开盖回书页，菜单不跨睡）。
 //
+// 网页调试台 /debug（DESIGN §11）：屏幕是外设不是命门 —— 面板 begin 失败/
+// 运行期连续 BUSY 超时都只降级（单屏/无头），不再 FATAL 卡死整机；WiFi、
+// 网页、OTA、串口照常活着。/debug 看设备/屏幕状态 + 远程串口日志尾巴 +
+// 复位面板/重画/翻页/重启；两屏全挂自动开热点救砖（无屏也能进 /debug）。
+//
 // P6 板载 4 键（src/Keys.h，GPIO1/2/9/10，电气台架 key_test 已过 2026-10-08）：
 //   Prev/Next = 上/下一对页（长按 250ms 后 300ms 连发，历史栈 48 对页可回退）、
-//   Menu 短按 = **主页（选书）** / 长按 250ms = 系统菜单、
-//   Font 短按 = 字号 / 长按 = 字体家族；
+//   Menu 短按 = **主页（选书）** / 长按 250ms = **阅读菜单**（主页里长按 = 系统菜单）、
+//   Font 短按 = 字号 / 长按 = 字体家族（主页里短按 = 打开书 / 长按 = 删书）；
 //   自动翻页**默认关**（真实阅读不自翻，串口 a 开 = 台架测试）。
 //   按键不参与深睡唤醒（唤醒只有霍尔 EXT1，2026-10-08 定案）。
 //
 // 主页（P7，src/HomePage.*）：左页书库列表（选中 '>' + [在读] 标记），右页
 // 正在读/书库统计/按键说明；Font 短按 = 打开选中书（选中当前读的那本 = 只回
-// 阅读页）；主页里 Prev/Next 上下选。串口同款：n 进出主页、j/k 选、空格打开。
-// 与系统菜单分层：菜单 = 设置（WiFi/OTA/上传），主页 = 选书；退出菜单按来源
-// 回主页或书页。合盖深睡记住"睡前屏上是主页还是书页"，开盖原样恢复。
+// 阅读页）；主页里 Prev/Next 上下选、**Font 长按 = 删除选中书**（确认屏）。
+// 串口同款：n 进出主页、j/k 选、空格打开。
+//
+// 阅读功能（2026-10-12，src/Bookmarks.* + src/ListPage.* + Book 扩展）：
+//   **Menu 长按 = 阅读菜单**（书页；主页里长按仍是系统菜单）：添加书签 /
+//   书签列表（跳回）/ 目录跳转（EPUB=NCX/nav 真目录，TXT=第X章启发式）/
+//   跳到进度（0–100% 每 5% 一档）/ 删除本书 / 系统设置 / 返回；
+//   页眉显示 "p.N · 42%" 全书进度%。书签存 NVS（每书 16 条上限），
+//   目录/进度跳转前把当前对页压入历史栈 → Prev 可跳回跳转前位置。
+//   串口：M=阅读菜单 k=加书签 t=目录 T=进度 D=删当前书（均走确认屏）。
 
 #include <ESP32epdx.h>
 #include <Preferences.h>
@@ -51,8 +63,14 @@
 #include "src/NetSvc.h"
 #include "src/SysMenu.h"
 #include "src/HomePage.h"
+#include "src/ListPage.h"
+#include "src/Bookmarks.h"
+#include "src/UiDraw.h"
 #include "src/Keys.h"
 #include <SD_MMC.h>
+// 串口日志镜像（必须放所有 include 的最后）：Serial 重定向到带 PSRAM 环形缓冲
+// 的代理 —— 本地串口照旧，网页 /debug 远程也能看同一份日志尾巴（DESIGN §11）
+#include "src/DbgLog.h"
 
 // === 引脚分配（DESIGN §1.1）===
 #define EINK_SCK   12
@@ -107,6 +125,25 @@ static bool g_autoFlip = false;
 // 选书、Menu 短按已在主页时不动。系统菜单与主页可叠（菜单优先分发），
 // 退出菜单按 g_home 回主页或书页
 static bool g_home = false;
+
+// === 阅读功能 UI 状态（2026-10-12：阅读菜单/书签/目录/进度，src/ListPage.*）===
+// menuList = 阅读菜单本体（Menu 长按进）；subList = 菜单下的子列表
+// （书签/目录/进度三选一，g_subMode 区分）；两者可叠（sub 在上），
+// 关闭 subList 回 menuList，关闭 menuList 回书页。串口也可直达 subList
+// （t/T 不开菜单直接进目录/进度），此时关闭回书页。
+static ListPage menuList;
+static ListPage subList;
+static const int SM_NONE = 0, SM_BM = 1, SM_TOC = 2, SM_GOTO = 3;
+static int g_subMode = SM_NONE;
+
+// 删除确认屏（独立顶层，盖在阅读菜单/主页之上）：g_confirmFrom =
+// 0 书页/串口直达、1 主页（Font 长按选中书）、2 阅读菜单（删除本书项）
+static bool g_confirmDel = false;
+static uint8_t g_confirmFrom = 0;
+static int g_confirmIdx = -1;
+
+// 阅读菜单动作反馈行（添加书签/无目录等），空 = 显示当前位置
+static char g_menuInfo2[56] = "";
 
 // P6 上一页的历史栈（函数见 setup 前的"按键翻页"块）：开机恢复点之前的页
 // 不可回退 → 换书/开书即清零（见 openBook）
@@ -219,11 +256,23 @@ uint8_t* fbShownL = nullptr;
 uint8_t* fbDrawL = nullptr;
 uint8_t* fbShownR = nullptr;
 uint8_t* fbDrawR = nullptr;
-bool dualOk = false;   // 两屏都就绪；false = 单屏退化
+bool dualOk = false;   // 两屏都就绪；false = 单屏/无头退化（= g_leftOk && g_rightOk）
 bool bookOk = false;   // 书可用；false = 退页码 demo
 uint32_t pageCount = 0;    // 刷新次数（管节奏 + 统计）
 uint32_t demoPage = 0;     // demo 页号（书不可用时用）
 int tmp1 = 0;
+
+// === 面板存活 + 运行期降级（DESIGN §11 网页调试台 /debug）===
+// 开机 begin() 结果 + 运行期连续 BUSY 超时（3 次）判死：死屏从刷新路径摘出去，
+// 不再每轮烧 8s 超时。左屏硬件挂了整机**不再 FATAL 卡死**（原来 while(1) 把
+// loop 焊死 → WiFi/WebServer 跟着全挂 = "左屏没响应网页也打不开"的根因），
+// 网页 /debug 可远程看串口日志、复位面板、翻页测试、OTA 重刷
+static bool g_leftOk = false, g_rightOk = false;
+static uint8_t s_strikeL = 0, s_strikeR = 0;
+static const uint8_t PANEL_STRIKES = 3;   // 连续 BUSY 超时次数 → 判死降级
+static char g_lastTag[16] = "-";          // 上次刷新来源（fast/menu/home…）
+static uint32_t g_lastMs = 0;             // 上次刷新耗时（/debug 显示）
+static bool g_lastOk = true;              // 上次刷新是否 BUSY 超时
 
 static uint8_t* allocFrame() {
   uint8_t* p = (uint8_t*)ps_malloc(EinkPanel::FULL_BYTES);
@@ -244,12 +293,55 @@ static void preparePages(bool fullMode) {
   }
 }
 
-// 一次双屏刷新（右屏没就绪时退单屏）。返回 false = BUSY 超时
+// 连续 PANEL_STRIKES 次 BUSY 超时（且探针显示 BUSY 仍没拉高）→ 判死降级：
+// 死屏从刷新路径摘出去，另一块照常；两块都死 = 无头模式（不碰 SPI，也就不
+// 再烧超时）。成功刷新即清零计数（瞬态干扰不冤枉屏）
+static void strikePanel(bool leftSide, bool ok) {
+  uint8_t& s = leftSide ? s_strikeL : s_strikeR;
+  if (ok) { s = 0; return; }
+  if (++s < PANEL_STRIKES) return;
+  (leftSide ? g_leftOk : g_rightOk) = false;
+  dualOk = g_leftOk && g_rightOk;
+  s = 0;
+  Serial.printf("[panel] %s dead after %u consecutive BUSY timeouts - degraded"
+                " (%s); /debug 可复位\n", leftSide ? "LEFT" : "RIGHT",
+                (unsigned)PANEL_STRIKES, dualOk ? "single screen" : "HEADLESS");
+}
+
+// 一次刷新（按面板存活降级；活着的屏刷自己那页 —— 另一缓冲照常画，只是不推送）。
+// 返回 false = BUSY 超时 / 无屏可刷
 static bool refreshPair(EinkPanel::Speed s) {
-  if (dualOk) return dual.present(fbShownL, fbDrawL, fbShownR, fbDrawR, s);
-  left.setSpeed(s);
-  if (!left.showDiff(fbShownL, fbDrawL, false)) return false;
-  return left.waitIdle(8000);
+  if (!g_leftOk && !g_rightOk) return false;   // 无头：不碰 SPI（也就不烧超时）
+  if (g_leftOk && g_rightOk) {
+    bool ok = dual.present(fbShownL, fbDrawL, fbShownR, fbDrawR, s);
+    // 超时分辨是哪块屏没回来：BUSY 还没拉高 = 它还卡着（另一块可能已完成）
+    if (!ok) {
+      strikePanel(true, left.idle());
+      strikePanel(false, right.idle());
+    } else {
+      strikePanel(true, true);
+      strikePanel(false, true);
+    }
+    return ok;
+  }
+  bool ok = true;
+  if (g_leftOk) {
+    left.setSpeed(s);
+    ok = left.showDiff(fbShownL, fbDrawL, false) && left.waitIdle(8000);
+    strikePanel(true, ok);
+  } else {
+    right.setSpeed(s);
+    ok = right.showDiff(fbShownR, fbDrawR, false) && right.waitIdle(8000);
+    strikePanel(false, ok);
+  }
+  return ok;
+}
+
+// 记录本次刷新（/debug 显示"上次刷新"行）
+static void noteRefresh(const char* tag, uint32_t dt, bool ok) {
+  snprintf(g_lastTag, sizeof(g_lastTag), "%s", tag);
+  g_lastMs = dt;
+  g_lastOk = ok;
 }
 
 static void swapPair() {
@@ -261,6 +353,13 @@ static void swapPair() {
 // 收割验证入口（定义见下方 handleSerial 区）：刷新/开机噪声窗口只放行
 // "恰好一个命令字符 + 换行"形态的用户输入，裸字节/乱码打 hex 丢弃
 static void harvestRx(const char* why);
+// 网页 /library/del 回调（定义见下方"阅读功能"块，setup 里挂到 net）
+static void onBookRemoved(const char* path);
+// /debug 网页调试台回调（定义见下方"网页调试台"块，setup 里挂到 net）
+static void dbgFillInfo(NetSvc::DbgInfo& i);
+static void dbgResetPanel(bool leftSide);
+static void dbgForceRefresh();
+static void dbgFlip(int delta);
 
 // 一轮：出内容 → 刷新 → 计时统计 → 双缓冲换挡
 static void runRefresh(bool fullMode) {
@@ -271,6 +370,7 @@ static void runRefresh(bool fullMode) {
   uint32_t dt = millis() - t0;
 
   stats.add(fullMode, dt, ok);
+  noteRefresh(fullMode ? "full" : "fast", dt, ok);
   Serial.printf("%s refresh #%lu%s: %lu ms (%s)\n",
                 fullMode ? "full" : "fast", (unsigned long)pageCount,
                 dualOk ? " L+R" : " L", (unsigned long)dt,
@@ -293,6 +393,7 @@ static void presentDraw(bool fullMode, const char* tag) {
   uint32_t dt = millis() - t0;
 
   stats.add(fullMode, dt, ok);
+  noteRefresh(tag, dt, ok);
   Serial.printf("%s %s refresh: %lu ms (%s)\n", tag,
                 fullMode ? "full" : "fast", (unsigned long)dt,
                 ok ? "ok" : "TIMEOUT");
@@ -340,7 +441,8 @@ static void openSysMenu() {
 
 // 主页入口（Menu 短按 / 串口 n）：选中项落到正在读的那本
 static void openHome() {
-  if (g_home || menu.isOpen()) return;
+  if (g_home || menu.isOpen() || menuList.isOpen() || subList.isOpen() || g_confirmDel)
+    return;
   home.open(s_libIdx, s_nlib);
   g_home = true;
   drawHomeRefresh(true);                 // 全刷：整屏换内容
@@ -554,8 +656,14 @@ void setup() {
   prefs.begin("eink-book");
 
   // 系统网络服务（菜单后端）：自带 NVS 命名空间 "eink-net"，WiFi 默认关
-  // （DESIGN §2 省电定案；菜单里手动开）。上传完成回调重扫书库
+  // （DESIGN §2 省电定案；菜单里手动开）。上传/删除完成回调重扫书库；
+  // /debug 调试台回调（状态注入 + 复位面板/重画/翻页，DESIGN §11）
   net.onBookAdded = onBookAdded;
+  net.onBookRemoved = onBookRemoved;
+  net.onDbgInfo = dbgFillInfo;
+  net.onDbgPanel = dbgResetPanel;
+  net.onDbgRefresh = dbgForceRefresh;
+  net.onDbgFlip = dbgFlip;
   net.begin();
 
   fbShownL = allocFrame();
@@ -583,15 +691,28 @@ void setup() {
   // 宽高/旋转保持这次 NewImage 的设置（几何参数跟着 buffer 走是错的，别改回 0）
   Paint_NewImage(fbShownL, EinkPanel::WIDTH, EinkPanel::HEIGHT, PAGE_ROTATE, WHITE);
 
-  if (!left.begin()) {
-    Serial.println("FATAL: left panel begin() BUSY timeout - check wiring");
-    while (1) delay(1000);
-  }
-  if (right.begin()) {
-    dualOk = true;
+  // 面板初始化：左屏失败**不再 FATAL 卡死**（原来 while(1) 焊死 loop →
+  // WebServer 永远不被轮询 = "左屏没响应网页也打不开"）。降级继续跑：
+  // 单屏（另一块照常显示）或无头（WiFi/OTA/串口/网页 /debug 全部活着）
+  g_leftOk = left.begin();
+  if (!g_leftOk)
+    Serial.println("WARN: left panel begin() BUSY timeout - check wiring;"
+                   " continuing (web /debug can re-init the panel)");
+  g_rightOk = right.begin();
+  dualOk = g_leftOk && g_rightOk;
+  if (dualOk) {
     Serial.println("both panels OK - dual overlapping mode");
+  } else if (g_leftOk) {
+    Serial.println("WARN: right panel down - single LEFT screen mode");
+  } else if (g_rightOk) {
+    Serial.println("WARN: left panel down - single RIGHT screen mode");
   } else {
-    Serial.println("WARN: right panel begin() timeout - single screen mode");
+    Serial.println("WARN: NO panel responding - headless mode"
+                   " (WiFi/OTA/serial/web all stay alive)");
+    // 两屏都挂：屏幕菜单/主页全没了 → 自动开配置热点当救砖通道，
+    // 手机连上热点开 /debug 就能远程诊断（看串口日志/复位面板/OTA 重刷）
+    net.startPortal();
+    Serial.println("[dbg] headless rescue: config portal opened for /debug access");
   }
 
   // === P4 书库：扫描 → 按 NVS 存档（无则 test_cn → test → 第一本）===
@@ -677,7 +798,8 @@ static bool hallClosing() {
 
 // 合盖 → 存对页位置 → SPI 引脚 hold → EXT1(开盖) 深睡。不返回
 static void enterDeepSleep() {
-  s_sleepMenu = menu.isOpen();   // 屏上是菜单帧 → 记账，开盖走全刷回书页
+  // 屏上不是书页（菜单/阅读菜单/子列表/删除确认）→ 记账，开盖全刷回书页
+  s_sleepMenu = menu.isOpen() || menuList.isOpen() || subList.isOpen() || g_confirmDel;
   s_sleepHome = g_home;          // 屏上是主页帧 → 记账，开盖走全刷回主页
   net.beforeSleep();             // 停 WebServer/OTA、关 WiFi 射频（深睡不带电）
   saveProgress();
@@ -731,8 +853,10 @@ static void nextBook() {
 
 // ===== 串口输入：命令分发 + 噪声窗口"收割验证" ===============================
 // 串口命令：f = 切字体家族（SD 包自动发现），s = 切字号 16/24/32，
-// b = 切下一本书，m = 系统菜单，n = 主页（选书），h = 状态
-//（P6 4 键落地后绑同一套接口：Menu 短按 = n / 长按 = m）
+// b = 切下一本书，m = 系统菜单，n = 主页（选书），h = 状态；
+// M = 阅读菜单（书签/目录/进度/删书），k = 直接加书签，t = 目录，T = 进度，
+// D = 删当前书（走确认屏，串口 y/空格确认、其他键取消）
+//（P6 4 键落地后绑同一套接口：Menu 短按 = n / 长按 = M（主页里长按 = m））
 // 三个输入窗口分开处理（P4 定案 2026-09-28）：
 //   · 等待期（5s 面板空闲，用户输入主窗口）→ handleSerial 每 20ms 轮询即时执行。
 //     原来只在等待前读一次，等待期收到的字节滞留到本轮刷新后被 drain 吞掉
@@ -757,22 +881,605 @@ static void applyMenuResult(SysMenu::Result r) {
   }
 }
 
+// ===== 阅读功能：阅读菜单 / 书签 / 目录 / 进度跳转（2026-10-12）=============
+// 数据：书签 = BmLoc（坐标语义与进度存档/对页历史栈一致，restoreAt 直接可用）；
+// 目录/进度 = Book 接口扩展（TxtBook 启发式扫"第X章" + EPUB NCX/nav 真目录；
+// 进度% EPUB 按 spine 章权重、TXT 按字节偏移）。UI 全部复用 ListPage：
+// menuList = 阅读菜单本体，subList = 其下子列表（书签/目录/进度）。
+
+static const char* libBase(const char* p) {   // "/books/alice.epub" → "alice"
+  static char buf[64];
+  const char* s = strrchr(p, '/');
+  s = s ? s + 1 : p;
+  snprintf(buf, sizeof(buf), "%s", s);
+  char* dot = strrchr(buf, '.');
+  if (dot && dot != buf) *dot = '\0';
+  return buf;
+}
+
+// 回阅读页：restartPair 重画当前对页（不推进页码）→ 快刷。菜单/列表退出共用
+static void backToBookPage() {
+  if (bookOk && book) book->restartPair();
+  runRefresh(false);
+}
+
+// ---- 阅读菜单（menuList）----
+
+static const char* kMenuItems[] = {
+  "添加书签", "书签列表", "目录跳转", "跳到进度", "删除本书", "系统设置", "返回",
+};
+static const char* kMenuHints[][2] = {
+  { "把当前对页存成书签", "书签列表里可跳回" },
+  { "查看本书全部书签", "Font 短按跳转到选中项" },
+  { "按章跳转（EPUB 真目录", "TXT 自动识别 第X章）" },
+  { "按全书百分比跳转", "列表选 0%–100%（5% 步进）" },
+  { "从 SD 卡删除本书", "书签与进度一并清除" },
+  { "WiFi / OTA / 书库服务", "系统级设置" },
+  { "关闭本菜单", "回阅读页" },
+};
+static const char* kMenuHintFlat[14];
+static bool kMenuFlatReady = false;
+static void ensureMenuFlat() {
+  if (kMenuFlatReady) return;
+  for (int i = 0; i < 7; i++) {
+    kMenuHintFlat[i * 2] = kMenuHints[i][0];
+    kMenuHintFlat[i * 2 + 1] = kMenuHints[i][1];
+  }
+  kMenuFlatReady = true;
+}
+
+static void drawBookMenuRefresh(bool fullMode) {
+  ensureMenuFlat();
+  char posInfo[56];
+  if (g_menuInfo2[0]) {
+    snprintf(posInfo, sizeof(posInfo), "%s", g_menuInfo2);
+  } else if (bookOk && book) {
+    uint16_t p = book->permille();
+    if (p <= 1000)
+      snprintf(posInfo, sizeof(posInfo), "p.%lu · %u%%",
+               (unsigned long)book->pairPageNo(), (unsigned)(p + 5) / 10);
+    else
+      snprintf(posInfo, sizeof(posInfo), "p.%lu", (unsigned long)book->pairPageNo());
+  } else {
+    snprintf(posInfo, sizeof(posInfo), "无书（demo 页）");
+  }
+
+  char bookInfo[56];
+  snprintf(bookInfo, sizeof(bookInfo), "《%s》",
+           s_libIdx >= 0 ? libBase(s_lib[s_libIdx].path) : "-");
+
+  ListPage::Ctx c;
+  c.title = "阅读菜单";
+  c.items = kMenuItems;
+  c.count = 7;
+  c.sel = 0;                    // 仅 open 用；draw 走内部选中态
+  c.hints = kMenuHintFlat;
+  c.info1 = bookInfo;
+  c.info2 = posInfo;
+  menuList.draw(fbDrawL, fbDrawR, c);
+  presentDraw(fullMode, "bookmenu");
+}
+
+// 进阅读菜单（书页 Menu 长按 / 串口 M）：全刷清上一帧残影
+static void openBookMenu() {
+  if (menuList.isOpen() || subList.isOpen() || menu.isOpen() || g_home) return;
+  g_menuInfo2[0] = '\0';
+  ListPage::Ctx c;              // open 只需要 count/sel，展示项 draw 时再拼
+  c.title = ""; c.items = kMenuItems; c.count = 7; c.sel = 0;
+  c.hints = nullptr; c.info1 = nullptr; c.info2 = nullptr;
+  menuList.open(c);
+  drawBookMenuRefresh(true);
+}
+
+// ---- 子列表（subList：书签/目录/进度）----
+
+static char s_bmItems[Bookmarks::MAX][48];
+static const char* s_bmPtr[Bookmarks::MAX];
+static int s_bmN = 0;
+
+static char (*s_tocItems)[48] = nullptr;    // PSRAM 256×48，惰性分配（DRAM 紧张）
+static const char* s_tocPtr[256];
+static int s_tocN = 0;
+
+static char s_gotoBuf[21][8];
+static const char* s_gotoPtr[21];
+static bool s_gotoReady = false;
+static void ensureGotoLabels() {
+  if (s_gotoReady) return;
+  for (int i = 0; i <= 20; i++) {
+    snprintf(s_gotoBuf[i], sizeof(s_gotoBuf[i]), "%d%%", i * 5);
+    s_gotoPtr[i] = s_gotoBuf[i];
+  }
+  s_gotoReady = true;
+}
+
+static ListPage::Ctx buildSubCtx() {
+  ListPage::Ctx c;
+  c.title = ""; c.items = nullptr; c.count = 0; c.sel = 0;
+  c.hints = nullptr; c.info1 = nullptr; c.info2 = nullptr;
+  switch (g_subMode) {
+    case SM_BM:
+      c.title = "书签"; c.items = s_bmPtr; c.count = s_bmN;
+      c.info1 = "本书书签"; c.info2 = g_menuInfo2;
+      break;
+    case SM_TOC:
+      c.title = "目录"; c.items = s_tocPtr; c.count = s_tocN;
+      c.info1 = "全书目录"; c.info2 = g_menuInfo2;
+      break;
+    case SM_GOTO: {
+      c.title = "跳到进度"; c.items = s_gotoPtr; c.count = 21;
+      static char cur[24];      // draw 同步消费，静态即可
+      uint16_t p = (bookOk && book) ? book->permille() : 0xFFFF;
+      if (p <= 1000) snprintf(cur, sizeof(cur), "当前 %u%%", (unsigned)(p + 5) / 10);
+      else snprintf(cur, sizeof(cur), "当前未知");
+      c.info1 = cur;
+      break;
+    }
+  }
+  return c;
+}
+
+static void drawSubRefresh(bool fullMode) {
+  ListPage::Ctx c = buildSubCtx();
+  subList.draw(fbDrawL, fbDrawR, c);
+  presentDraw(fullMode, "sublist");
+}
+
+// 关子列表：回阅读菜单（子列表只能从阅读菜单进；串口 t/T 直达时菜单未开 → 回书页）
+static void closeSubList() {
+  subList.close();
+  g_subMode = SM_NONE;
+  if (menuList.isOpen()) drawBookMenuRefresh(false);
+  else backToBookPage();
+}
+
+static void closeAllNav() {
+  subList.close();
+  menuList.close();
+  g_subMode = SM_NONE;
+}
+
+static void pickSubItem();   // 定义在子列表打开函数之后，applyListResult 先引用
+
+static void applyListResult(ListPage::Result r) {
+  if (r == ListPage::REDRAW) drawSubRefresh(false);
+  else if (r == ListPage::CLOSE) closeSubList();
+  else if (r == ListPage::PICK) pickSubItem();
+}
+
+// 添加书签（阅读菜单项 0 / 串口 k）。false = 无书/坐标无效/NVS 满
+static bool addBookmarkNow() {
+  if (!bookOk || !book || s_libIdx < 0) return false;
+  long pos = book->pairFilePos();
+  if (pos < 0) return false;
+  BmLoc b = { pos, book->pairPageNo(),
+              bookIsEpub ? (int16_t)epub.pairChapter() : (int16_t)-1,
+              book->permille() };
+  bool ok = Bookmarks::add(s_lib[s_libIdx].path, b);
+  Serial.printf("[bm] add %s -> %s (total %d)\n", s_lib[s_libIdx].path,
+                ok ? "ok" : "FULL/FAIL", Bookmarks::count(s_lib[s_libIdx].path));
+  return ok;
+}
+
+// ---- 删除确认屏（独立顶层）----
+
+static void drawConfirmRefresh(bool fullMode) {
+  const char* name = (g_confirmIdx >= 0 && g_confirmIdx < s_nlib)
+                         ? libBase(s_lib[g_confirmIdx].path) : "?";
+  bool isCur = (g_confirmIdx == s_libIdx);
+
+  Paint_SelectImage(fbDrawL);
+  Paint_Clear(WHITE);
+  drawBorder();
+  drawCjkStr(24, 20, "删除确认", 32);
+  drawThickRule(24, 62, EinkPanel::PAGE_W - 24);
+  drawUtf8(24, 100, "将从 SD 卡永久删除：", EinkPanel::PAGE_W - 32);
+  { String s = F("《"); s += name; s += F("》");
+    drawUtf8(24, 130, s.c_str(), EinkPanel::PAGE_W - 32); }
+  drawUtf8(24, 160, "书签与阅读进度一并清除", EinkPanel::PAGE_W - 32);
+  drawUtf8(24, 190, "删除后不可恢复", EinkPanel::PAGE_W - 32);
+  drawThickRule(24, 260, EinkPanel::PAGE_W - 24);
+  drawUtf8(24, 290, "Font 短按 = 确认删除", EinkPanel::PAGE_W - 32);
+  drawUtf8(24, 320, "其他任何键 = 取消", EinkPanel::PAGE_W - 32);
+
+  Paint_SelectImage(fbDrawR);
+  Paint_Clear(WHITE);
+  drawBorder();
+  drawCjkStr(24, 20, "本书", 32);
+  drawThickRule(24, 62, EinkPanel::PAGE_W - 24);
+  char buf[72];
+  snprintf(buf, sizeof(buf), "《%s》%s", name, isCur ? "（在读）" : "");
+  drawUtf8(24, 100, buf, EinkPanel::PAGE_W - 32);
+  if (g_confirmIdx >= 0 && g_confirmIdx < s_nlib) {
+    File f = SD_MMC.open(s_lib[g_confirmIdx].path, FILE_READ);
+    if (f) {
+      size_t sz = f.size();
+      f.close();
+      snprintf(buf, sizeof(buf), "%s · %lu KB",
+               s_lib[g_confirmIdx].epub ? "EPUB" : "TXT",
+               (unsigned long)((sz + 512) >> 10));
+      drawUtf8(24, 130, buf, EinkPanel::PAGE_W - 32);
+    }
+  }
+  drawUtf8(24, 190, "确认后顺位打开书库", EinkPanel::PAGE_W - 32);
+  drawUtf8(24, 220, "下一本可读的书", EinkPanel::PAGE_W - 32);
+  presentDraw(fullMode, "confirm");
+}
+
+static void enterConfirmDelete(int idx) {
+  if (idx < 0 || idx >= s_nlib) return;
+  closeAllNav();                 // 确认屏独立顶层：清掉菜单/子列表
+  g_confirmIdx = idx;
+  g_confirmDel = true;
+  drawConfirmRefresh(true);
+}
+
+static void cancelConfirmDelete() {
+  g_confirmDel = false;
+  if (g_confirmFrom == 1 || g_home) drawHomeRefresh(false);
+  else if (g_confirmFrom == 2) openBookMenu();
+  else backToBookPage();
+}
+
+// 删书公共内核（确认屏与网页 /library/del 共用）：
+// 清书签 + 指向本书的进度存档 → SD 删文件 → 重扫 → 若删的是在读那本，
+// 顺位打开书库下一本可读的书。刷屏由调用方按当前 UI 上下文做。
+static bool removeBookByPath(const char* path) {
+  int idx = -1;
+  for (int i = 0; i < s_nlib; i++)
+    if (!strcmp(path, s_lib[i].path)) { idx = i; break; }
+  if (idx < 0) return false;
+  bool wasCur = book && bookOk && idx == s_libIdx;
+
+  Bookmarks::clear(path);
+  { String last = prefs.getString("book", "");
+    if (last.equals(path)) {
+      prefs.remove("book"); prefs.remove("pos");
+      prefs.remove("page"); prefs.remove("ch");
+    } }
+
+  if (!SD_MMC.remove(path))
+    Serial.printf("WARN: SD remove %s failed（写路径可能锁死）\n", path);
+
+  if (wasCur) { book->close(); book = nullptr; bookOk = false; s_libIdx = -1; s_histN = 0; }
+  char cur[64] = "";
+  if (!wasCur && book && s_libIdx >= 0)
+    snprintf(cur, sizeof(cur), "%s", s_lib[s_libIdx].path);
+
+  scanLibrary();
+
+  if (wasCur) {
+    for (int i = 0; i < s_nlib; i++)
+      if (openBook(i)) {               // 顺位开下一本可读的书（从第 0 对页起）
+        bookOk = true;
+        prefs.remove("pos"); prefs.remove("page"); prefs.remove("ch");
+        saveProgress();
+        break;
+      }
+    if (!bookOk) book = nullptr;
+  } else if (cur[0]) {                 // 找回当前书新下标（重扫后可能位移）
+    s_libIdx = -1;
+    for (int i = 0; i < s_nlib; i++)
+      if (!strcmp(cur, s_lib[i].path)) { s_libIdx = i; break; }
+  }
+  Serial.printf("[lib] deleted %s%s\n", path, wasCur ? " (was current)" : "");
+  return wasCur;
+}
+
+static void doConfirmDelete() {
+  g_confirmDel = false;
+  if (g_confirmIdx < 0 || g_confirmIdx >= s_nlib) { backToBookPage(); return; }
+  removeBookByPath(s_lib[g_confirmIdx].path);
+  if (g_confirmFrom == 1 || g_home) {   // 主页路径：留在主页（选中留在原位附近）
+    home.select(s_nlib > 0 ? (g_confirmIdx < s_nlib ? g_confirmIdx : s_nlib - 1) : 0);
+    drawHomeRefresh(false);
+  } else {                              // removeBookByPath 已顺位开下一本/留 demo
+    runRefresh(true);
+  }
+}
+
+// 网页 /library/del 回调（NetSvc，loop 等待窗上下文）：删完按当前屏重画
+static void onBookRemoved(const char* path) {
+  removeBookByPath(path);
+  if (g_confirmDel) {            // 确认屏正好开着：收掉（书已没了，确认无意义）
+    g_confirmDel = false;
+    runRefresh(true);
+    return;
+  }
+  if (menu.isOpen()) showMenuRefresh(false);
+  else if (subList.isOpen()) drawSubRefresh(false);
+  else if (menuList.isOpen()) drawBookMenuRefresh(false);
+  else if (g_home) drawHomeRefresh(false);
+  else runRefresh(true);
+}
+
+// ---- 网页调试台 /debug（DESIGN §11）----
+// 屏幕挂了也能远程诊断：状态经 net.onDbgInfo 注入，动作走回调在 loop 等待窗
+// 上下文执行（与 onBookAdded 同上下文，可以安全刷屏）。
+
+static void dbgFillInfo(NetSvc::DbgInfo& i) {
+  i.mode = dualOk ? "双屏"
+                  : (g_leftOk ? "仅左屏" : (g_rightOk ? "仅右屏" : "无头"));
+  i.leftOk = g_leftOk;
+  i.rightOk = g_rightOk;
+  i.busyL = digitalRead(PIN_L_BUSY);
+  i.busyR = digitalRead(PIN_R_BUSY);
+  int hl = digitalRead(PIN_HALL);
+  i.hallText = (hl == HALL_CLOSED_LEVEL) ? "合盖" : "开盖";
+  i.pageCount = pageCount;
+  i.lastMs = g_lastMs;
+  i.lastOk = g_lastOk;
+  i.lastTag = g_lastTag;
+  stats.get(false, i.fastN, i.fastAvg, i.fastMin, i.fastMax, i.fastTo);
+  stats.get(true,  i.fullN, i.fullAvg, i.fullMin, i.fullMax, i.fullTo);
+  i.libCount = s_nlib;
+  i.bookOk = bookOk && book;
+  i.bookName = i.bookOk ? libBase(s_lib[s_libIdx].path) : "-";
+  i.page = i.bookOk ? (long)book->pairPageNo() : -1;
+  if (i.bookOk) {
+    uint16_t p = book->permille();
+    i.pct = (p <= 1000) ? (int)(p + 5) / 10 : -1;
+  } else i.pct = -1;
+  i.sdOk = Storage::begin();
+  i.sdUsedMb = i.sdOk ? (unsigned long)(SD_MMC.usedBytes() >> 20) : 0;
+  i.sdTotalMb = i.sdOk ? (unsigned long)(SD_MMC.totalBytes() >> 20) : 0;
+  i.keysBounce = keys.bounce();
+  i.keysOvf = keys.overflow();
+}
+
+// 网页"复位某屏"：begin() = SPI 重init + 硬复位 + 重新上电（屏卡在 BUSY
+// 时 RST 脉冲能把它拉回来）；成功即恢复该屏进刷新路径
+static void dbgResetPanel(bool leftSide) {
+  bool ok;
+  if (leftSide) { s_strikeL = 0; ok = left.begin(); g_leftOk = ok; }
+  else          { s_strikeR = 0; ok = right.begin(); g_rightOk = ok; }
+  dualOk = g_leftOk && g_rightOk;
+  Serial.printf("[dbg] web: re-init %s panel -> %s%s\n",
+                leftSide ? "LEFT" : "RIGHT", ok ? "OK" : "FAILED (BUSY timeout)",
+                dualOk ? " (dual mode)" : "");
+}
+
+// 网页"重画当前屏"：按当前 UI 上下文重画（与 onBookRemoved 同款分发），
+// 别把菜单/主页帧顶掉
+static void dbgForceRefresh() {
+  Serial.println("[dbg] web: force redraw");
+  if (g_confirmDel) drawConfirmRefresh(true);
+  else if (subList.isOpen()) drawSubRefresh(true);
+  else if (menuList.isOpen()) drawBookMenuRefresh(true);
+  else if (menu.isOpen()) showMenuRefresh(true);
+  else if (g_home) drawHomeRefresh(true);
+  else { if (bookOk && book) book->restartPair(); runRefresh(true); }
+}
+
+// 网页"翻页测试"：只在书页上下文有意义（导航 UI 开着时 Prev/Next 是"选择"）
+static void dbgFlip(int delta) {
+  if (menu.isOpen() || menuList.isOpen() || subList.isOpen() || g_confirmDel ||
+      g_home) {
+    Serial.println("[dbg] web flip ignored: nav UI open on screen");
+    return;
+  }
+  Serial.printf("[dbg] web: turn %+d pair(s)\n", delta);
+  turnPage(delta);
+}
+
+// ---- 子列表打开（阅读菜单项 / 串口 t/T 直达）----
+
+static void openBookmarkSub() {
+  if (!bookOk || !book || s_libIdx < 0) {
+    Serial.println("[bm] no book open");
+    if (menuList.isOpen()) {
+      snprintf(g_menuInfo2, sizeof(g_menuInfo2), "没有在读的书");
+      drawBookMenuRefresh(false);
+    }
+    return;
+  }
+  const char* path = s_lib[s_libIdx].path;
+  int n = Bookmarks::count(path);
+  if (!n) {
+    snprintf(g_menuInfo2, sizeof(g_menuInfo2), "还没有书签（先添加）");
+    drawBookMenuRefresh(false);
+    return;
+  }
+  s_bmN = n;
+  for (int i = 0; i < n; i++) {
+    BmLoc b;
+    if (!Bookmarks::get(path, i, b)) { s_bmN = i; break; }
+    unsigned pct = (b.permille <= 1000) ? (unsigned)(b.permille + 5) / 10 : 0;
+    if (b.ch >= 0)
+      snprintf(s_bmItems[i], sizeof(s_bmItems[i]), "p.%lu · %u%% · ch%d",
+               (unsigned long)b.page, pct, (int)b.ch + 1);
+    else
+      snprintf(s_bmItems[i], sizeof(s_bmItems[i]), "p.%lu · %u%%",
+               (unsigned long)b.page, pct);
+    s_bmPtr[i] = s_bmItems[i];
+  }
+  snprintf(g_menuInfo2, sizeof(g_menuInfo2), "共 %d 条 · 选中跳回", s_bmN);
+  ListPage::Ctx c;
+  c.title = "书签"; c.items = s_bmPtr; c.count = s_bmN; c.sel = 0;
+  c.hints = nullptr; c.info1 = nullptr; c.info2 = nullptr;
+  subList.open(c);
+  g_subMode = SM_BM;
+  drawSubRefresh(true);
+}
+
+static void openTocSub() {
+  if (!bookOk || !book) {
+    Serial.println("[toc] no book open");
+    if (menuList.isOpen()) {
+      snprintf(g_menuInfo2, sizeof(g_menuInfo2), "没有在读的书");
+      drawBookMenuRefresh(false);
+    }
+    return;
+  }
+  int n = book->tocCount();
+  if (!n) {
+    snprintf(g_menuInfo2, sizeof(g_menuInfo2), "%s",
+             bookIsEpub ? "这本书没有目录" : "未识别到章节（第X章/Chapter N）");
+    if (menuList.isOpen()) drawBookMenuRefresh(false);
+    return;
+  }
+  if (!s_tocItems) s_tocItems = (char(*)[48])ps_malloc(256 * 48);
+  if (!s_tocItems) { Serial.println("WARN: toc items alloc failed"); return; }
+  s_tocN = n;
+  char t[44];
+  for (int i = 0; i < n; i++) {
+    if (!book->tocTitle(i, t, sizeof(t))) t[0] = '\0';
+    snprintf(s_tocItems[i], 48, "%d. %s", i + 1, t);
+    s_tocPtr[i] = s_tocItems[i];
+  }
+  uint16_t p = book->permille();
+  if (p <= 1000)
+    snprintf(g_menuInfo2, sizeof(g_menuInfo2), "全书 %u%% · 选中跳章",
+             (unsigned)(p + 5) / 10);
+  else
+    snprintf(g_menuInfo2, sizeof(g_menuInfo2), "选中跳章");
+  ListPage::Ctx c;
+  c.title = "目录"; c.items = s_tocPtr; c.count = s_tocN; c.sel = 0;
+  c.hints = nullptr; c.info1 = nullptr; c.info2 = nullptr;
+  subList.open(c);
+  g_subMode = SM_TOC;
+  drawSubRefresh(true);
+}
+
+static void openGotoSub() {
+  if (!bookOk || !book) {
+    Serial.println("[goto] no book open");
+    if (menuList.isOpen()) {
+      snprintf(g_menuInfo2, sizeof(g_menuInfo2), "没有在读的书");
+      drawBookMenuRefresh(false);
+    }
+    return;
+  }
+  ensureGotoLabels();
+  uint16_t p = book->permille();
+  int sel = (p <= 1000) ? (int)(p + 25) / 50 : 0;   // 初始选中落到最近的 5% 档
+  if (sel > 20) sel = 20;
+  ListPage::Ctx c;
+  c.title = "跳到进度"; c.items = s_gotoPtr; c.count = 21; c.sel = sel;
+  c.hints = nullptr; c.info1 = nullptr; c.info2 = nullptr;
+  subList.open(c);
+  g_subMode = SM_GOTO;
+  drawSubRefresh(true);
+}
+
+// 子列表"执行"：书签跳回 / 跳章 / 跳进度。跳前把当前对页压历史栈
+// （Prev 可一步步跳回跳转前位置），跳后进度落盘
+static void pickSubItem() {
+  int sel = subList.sel();
+  if (!bookOk || !book) { closeSubList(); return; }
+  if (g_subMode == SM_BM) {
+    BmLoc b;
+    if (s_libIdx < 0 || !Bookmarks::get(s_lib[s_libIdx].path, sel, b)) return;
+    histPush();
+    if (!restoreAt(b.off, b.page, b.ch)) {
+      Serial.println("WARN: bookmark restore failed");
+      return;
+    }
+    closeAllNav();
+    saveProgress();
+    runRefresh(false);
+  } else if (g_subMode == SM_TOC) {
+    histPush();
+    if (!book->jumpToToc(sel)) {
+      Serial.println("WARN: toc jump failed");
+      return;
+    }
+    closeAllNav();
+    saveProgress();
+    runRefresh(true);            // 整章切换，全刷清残影
+  } else if (g_subMode == SM_GOTO) {
+    histPush();
+    if (!book->jumpPermille((uint16_t)(sel * 50))) {   // 5% 步进 → 千分比
+      Serial.println("WARN: percent jump failed");
+      return;
+    }
+    closeAllNav();
+    saveProgress();
+    runRefresh(true);
+  }
+}
+
+// 阅读菜单"执行"
+static void pickMenuItem() {
+  switch (menuList.sel()) {
+    case 0: {                    // 添加书签（停留在菜单，信息行给反馈）
+      if (!bookOk || !book || s_libIdx < 0) {
+        snprintf(g_menuInfo2, sizeof(g_menuInfo2), "没有在读的书");
+        break;
+      }
+      const char* path = s_lib[s_libIdx].path;
+      int n = Bookmarks::count(path);
+      bool ok = addBookmarkNow();
+      if (ok) snprintf(g_menuInfo2, sizeof(g_menuInfo2), "已添加书签（共 %d 条）", n + 1);
+      else snprintf(g_menuInfo2, sizeof(g_menuInfo2), "%s",
+                    n >= Bookmarks::MAX ? "书签已满（16 条上限）" : "添加失败");
+      break;
+    }
+    case 1: openBookmarkSub(); return;   // 内部自画/空表自停留
+    case 2: openTocSub(); return;
+    case 3: openGotoSub(); return;
+    case 4: {                    // 删除本书
+      int idx = s_libIdx;
+      g_confirmFrom = 2;
+      enterConfirmDelete(idx >= 0 ? idx : 0);
+      return;
+    }
+    case 5: closeAllNav(); openSysMenu(); return;
+    case 6: closeAllNav(); backToBookPage(); return;
+  }
+  drawBookMenuRefresh(false);
+}
+
+static void applyMenuListResult(ListPage::Result r) {
+  if (r == ListPage::REDRAW) drawBookMenuRefresh(false);
+  else if (r == ListPage::CLOSE) { menuList.close(); backToBookPage(); }
+  else if (r == ListPage::PICK) pickMenuItem();
+}
+
 static void execSerialCmd(char c) {
-  // 菜单打开：字节全部交给菜单（j/k 导航、Enter/空格执行、q/m 退出；
-  // ESC 等杂字节被 key() 吞掉）—— f/s/b/h/a 在菜单期间刻意不响应
+  // 菜单/列表/确认屏打开：字节全部交给对应 UI（j/k 导航、Enter/空格执行、
+  // q/m 退出；f/s/b/h/a 在菜单期间刻意不响应）——优先级 = 视觉叠放顺序
   if (menu.isOpen()) {
     applyMenuResult(menu.key(c));
     return;
   }
-  // 主页打开：字节交给主页（j/k 选书、空格/回车打开、q/n 回书页；
-  // f/s/b/h/a 在主页期间刻意不响应），m 仍是系统菜单
+  if (subList.isOpen()) {
+    applyListResult(subList.key(c));
+    return;
+  }
+  if (menuList.isOpen()) {
+    applyMenuListResult(menuList.key(c));
+    return;
+  }
+  if (g_confirmDel) {
+    if (c == 'y' || c == ' ') doConfirmDelete();
+    else cancelConfirmDelete();
+    return;
+  }
+  // 主页打开：字节交给主页（j/k 选书、空格/回车打开、q/n 回书页、
+  // m = 系统菜单、D = 删除选中书；f/s/b/h/a 在主页期间刻意不响应）
   if (g_home) {
     if (c == 'm') { openSysMenu(); return; }
+    if (c == 'D') { g_confirmFrom = 1; enterConfirmDelete(home.selected()); return; }
     applyHomeResult(home.key(c));
     return;
   }
   if (c == 'm') {
     openSysMenu();                   // 全刷，清上一帧残影
+    return;
+  }
+  if (c == 'M') {
+    openBookMenu();                  // 阅读菜单（书签/目录/进度/删书）
+    return;
+  }
+  if (c == 'k') {
+    if (!addBookmarkNow()) Serial.println("[bm] add failed (no book / full)");
+    return;
+  }
+  if (c == 't') { openTocSub(); return; }     // 直达目录（不开阅读菜单）
+  if (c == 'T') { openGotoSub(); return; }    // 直达进度跳转
+  if (c == 'D') {                             // 删当前书（确认屏，y/空格确认）
+    if (s_libIdx >= 0) { g_confirmFrom = 0; enterConfirmDelete(s_libIdx); }
     return;
   }
   if (c == 'f' && CJK.familyCount() > 1) {
@@ -853,15 +1560,17 @@ static void handleSerial() {
 }
 
 // ===== P6 板载 4 键分发（电气台架 key_test 已过，2026-10-08）==========
-//   书页：Prev/Next = 上/下一对页（长按 250ms 后每 300ms 连发）、
-//         Menu 短按 = 主页（选书，src/HomePage）/ 长按 250ms = 系统菜单、
+//   书页：Prev/Next = 上/下一对页（长按 250ms 后每 300ms 连发，历史栈 48 对页
+//         可回退）、Menu 短按 = 主页 / 长按 = 阅读菜单、
 //         Font 短按 = 字号(s) / 长按 = 字体家族(f)
 //   主页：Prev/Next = 上下选书（连发=滚动）、Font 短按 = 打开选中书、
-//         Menu 短按 = 已在主页（不动）、长按 = 系统菜单
-//   菜单内：Prev/Next = 上下（连发=滚动）、Font 短按 = 执行、Menu = 退出
+//         Font 长按 = 删除选中书（确认屏）、Menu 短按 = 不动、长按 = 系统菜单
+//   阅读菜单/子列表：Prev/Next = 上下（连发=滚动）、Font 短按 = 执行、
+//         Menu = 退出（回上一层）
+//   删除确认屏：Font 短按 = 确认、其他任何键 = 取消
 //   睡着时按过的键：Keys 不补发按下 → 消费端再挡一次（sawPress）
 static bool g_keyDown[Keys::COUNT] = {false};   // RELEASE 前必须见过 PRESS
-// 菜单内按 Menu 退出的那一次按住：菜单在 PRESS 就关了，这次按住剩下的
+// 菜单/列表内按 Menu 退出的那一次按住：菜单在 PRESS 就关了，这次按住剩下的
 // LONG/RELEASE 必须吞掉 —— 否则 LONG 会再开一次菜单、RELEASE 会当成短按回主页
 static bool g_menuExitSwallow = false;
 
@@ -878,6 +1587,38 @@ static void keyAction(uint8_t id, uint8_t ev, bool longFired, bool sawPress) {
     }
     return;                                      // LONG/REPEAT/多余 RELEASE 吞掉
   }
+  if (subList.isOpen()) {                        // 子列表（在阅读菜单之上）
+    if ((id == Keys::PREV || id == Keys::NEXT) &&
+        (ev == Keys::PRESS || ev == Keys::LONG || ev == Keys::REPEAT))
+      applyListResult(subList.key(id == Keys::PREV ? 'k' : 'j'));
+    else if (id == Keys::FONT && ev == Keys::RELEASE && !longFired && sawPress)
+      applyListResult(subList.key(' '));         // 短按 = 执行（跳回/跳章/跳进度）
+    else if (id == Keys::MENU && ev == Keys::PRESS) {
+      g_menuExitSwallow = true;
+      applyListResult(subList.key('q'));         // 退回阅读菜单
+    }
+    return;
+  }
+  if (menuList.isOpen()) {                       // 阅读菜单
+    if ((id == Keys::PREV || id == Keys::NEXT) &&
+        (ev == Keys::PRESS || ev == Keys::LONG || ev == Keys::REPEAT))
+      applyMenuListResult(menuList.key(id == Keys::PREV ? 'k' : 'j'));
+    else if (id == Keys::FONT && ev == Keys::RELEASE && !longFired && sawPress)
+      applyMenuListResult(menuList.key(' '));    // 短按 = 执行当前项
+    else if (id == Keys::MENU && ev == Keys::PRESS) {
+      g_menuExitSwallow = true;
+      applyMenuListResult(menuList.key('q'));    // 退回书页
+    }
+    return;
+  }
+  if (g_confirmDel) {                            // 删除确认屏（独立顶层）
+    if (id == Keys::FONT && ev == Keys::RELEASE && !longFired && sawPress)
+      doConfirmDelete();                         // Font 短按 = 确认
+    else if ((id == Keys::MENU || id == Keys::PREV || id == Keys::NEXT) &&
+             ev == Keys::PRESS)
+      cancelConfirmDelete();                     // 其他任何键 = 取消
+    return;                                      // FONT LONG 等其余事件吞掉
+  }
   if (id == Keys::MENU) {
     // 一次按住在 PRESS 时不表态，等 LONG（长按到点）或 RELEASE（松开）再分岔：
     // RELEASE 带 longFired 就能区分短按/长按，不必在按下时抢开菜单
@@ -886,16 +1627,22 @@ static void keyAction(uint8_t id, uint8_t ev, bool longFired, bool sawPress) {
       if (!longFired && sawPress && !g_home) openHome();   // 短按 = 主页
       return;
     }
-    if (ev == Keys::LONG) {                      // 长按 = 系统菜单
-      if (!g_menuExitSwallow) openSysMenu();
+    if (ev == Keys::LONG) {        // 长按：书页 = 阅读菜单，主页 = 系统菜单
+      if (!g_menuExitSwallow) {
+        if (g_home) openSysMenu();
+        else openBookMenu();
+      }
       return;
     }
     if (ev == Keys::PRESS) g_menuExitSwallow = false;   // 新一轮按住，清上轮标记
     return;                                      // 等 LONG / RELEASE
   }
-  if (g_home) {                                  // 主页：Font 短按 = 打开选中书
-    if (id == Keys::FONT && ev == Keys::RELEASE && !longFired && sawPress)
-      applyHomeResult(home.key(' '));
+  if (g_home) {                    // 主页：Font 短按 = 打开 / 长按 = 删除选中书
+    if (id == Keys::FONT) {
+      if (ev == Keys::LONG) { g_confirmFrom = 1; enterConfirmDelete(home.selected()); }
+      else if (ev == Keys::RELEASE && !longFired && sawPress)
+        applyHomeResult(home.key(' '));
+    }
     return;                                      // Prev/Next 在 drainKeys 里并批
   }
   if (id == Keys::FONT) {
@@ -918,12 +1665,15 @@ static void drainKeys() {
   for (int i = 0; i < n;) {
     if (ev[i].ev == Keys::PRESS) g_keyDown[ev[i].id] = true;
 
-    // 每个事件现读菜单状态：同批里 MENU 刚开/关了菜单，后续翻页事件要跟上
-    bool menuOpen = menu.isOpen();
+    // 每个事件现读 UI 状态：同批里 MENU 刚开/关了菜单，后续翻页事件要跟上。
+    // navOpen = 任一导航 UI 在屏（系统菜单/阅读菜单/子列表/删除确认）——
+    // 这些状态下 Prev/Next 是"选择"不是"翻页"，不走并批，逐条给 keyAction
+    bool navOpen = menu.isOpen() || menuList.isOpen() || subList.isOpen() ||
+                   g_confirmDel;
     bool pageKey = ev[i].id == Keys::PREV || ev[i].id == Keys::NEXT;
     bool pageEv = ev[i].ev == Keys::PRESS || ev[i].ev == Keys::LONG ||
                   ev[i].ev == Keys::REPEAT;
-    if (!menuOpen && pageKey && pageEv) {
+    if (!navOpen && pageKey && pageEv) {
       int delta = 0, j = i;
       // 翻页键的 RELEASE 一并吸收（不清批、不翻页）：连按 N 下产生的是
       // PRESS,RELEASE 交替序列，RELEASE 断批会让每次点按各刷一次屏 ——
@@ -985,8 +1735,10 @@ void loop() {
   }
   if (hallClosing()) enterDeepSleep();
 
-  // 菜单/主页开着：屏保持该 UI，跳过自动翻页（下一轮照常轮询串口/网络/霍尔）
-  if (menu.isOpen() || g_home) return;
+  // 菜单/阅读菜单/子列表/确认屏/主页开着：屏保持该 UI，跳过自动翻页
+  // （下一轮照常轮询串口/网络/霍尔）
+  if (menu.isOpen() || menuList.isOpen() || subList.isOpen() || g_confirmDel || g_home)
+    return;
 
   refreshOnce();
 }

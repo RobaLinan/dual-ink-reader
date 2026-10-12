@@ -11,6 +11,10 @@ public:
   void add(bool full, uint32_t dt, bool ok);
   void printSummary(uint32_t pageCount, uint32_t fastTargetMs) const;
 
+  // /debug 网页用（DESIGN §11）：读一组统计（n 不含超时次数）
+  void get(bool full, uint32_t& n, uint32_t& avg, uint32_t& min,
+           uint32_t& max, uint32_t& timeouts) const;
+
 private:
   struct S {
     uint32_t n = 0, sum = 0, tmin = 0, tmax = 0, timeouts = 0;
