@@ -703,8 +703,14 @@ bool EpubBook::restartPair() {
 
 bool EpubBook::restorePair(uint16_t ch, long off, uint32_t page) {
   if (!m_ok) return false;
-  if ((ch >= m_nChapters || !loadChapter(ch)) ) {
-    // 章号非法或本章坏：退回第一章开头
+  if (ch >= m_nChapters) {
+    // 章号非法：退回第一章开头
+    if (!loadChapter(0)) return false;
+    off = 0; page = 0;
+  } else if (ch != m_chapter && !loadChapter(ch)) {
+    // 跨章回退才需重新解压转换；同章（回退最常见情形）m_txt 的临时文本仍
+    // 对应当前章，直接 seek 即可——无条件 loadChapter 会把每次同章回退都
+    // 拖成整章解压+解析（几秒到十几秒，TXT 翻页快即因它只 seek）
     if (!loadChapter(0)) return false;
     off = 0; page = 0;
   }
