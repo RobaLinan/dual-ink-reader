@@ -72,6 +72,11 @@ public:
   }
   void nl() { if (m_last != '\n') put('\n'); }
 
+  // 块前分隔（emitImageMarker 用）：行首不添任何东西；行内接空格。
+  // 不能无脑 nl()——同章相邻两张整页图（漫画对页，见 DESIGN §12）之间
+  // 的空行会把右页图挤到下一页，左右屏配对错位。
+  void sep() { if (m_last != '\n' && m_last != ' ') put(' '); }
+
 private:
   void flush() {
     if (m_len > 0 && m_f) {
@@ -148,7 +153,7 @@ static void emitImageMarker(TextSink& sink, const char* docDir, const char* src)
   resolveZipPath(path, sizeof(path), docDir, src);
   if (!path[0]) return;
 
-  sink.nl();
+  sink.sep();
   const char kMarker[] = "[[img:";
   for (const char* p = kMarker; *p; p++) sink.put(*p);
   for (const char* p = path; *p; p++) {
@@ -156,7 +161,11 @@ static void emitImageMarker(TextSink& sink, const char* docDir, const char* src)
     else sink.put(*p);
   }
   sink.put(']'); sink.put(']');
-  sink.nl();
+  // 后分隔 = 空格而不是换行：同章相邻图标记在文本流里以空格接排，两张整页图
+  // 才能连续落满左右面板（换行会先占一个空行，右页图被挤到下一页，漫画对页
+  // 配对错位，DESIGN §12）。空格经 put 直写——走 text() 会被 pendingSpace 吞掉。
+  // 对文字书：图后的正文接排在本页图下方（placeImageBlock 本就把图独占成块）。
+  sink.put(' ');
 }
 
 // 遍历 DOM 抽正文。style/script/title/head 子树整棵跳过；body 内才是书。
@@ -656,9 +665,12 @@ bool EpubBook::renderPair(uint8_t* fbL, uint8_t* fbR) {
   m_pairStartPage = m_page;
   m_txt.setPermille((int)permille());   // 页眉进度% = 全局（章权重+章内偏移）
 
-  // 左页。空章（转换失败/无文本）连续跳过，全坏则书不可用
+  // 左页。空章（转换失败/无文本/纯空白页）连续跳过，全坏则书不可用。
+  // 纯空白页 = TxtBook 按"无内容"返回 false（见 TxtBook::renderPage 的
+  // s_hadContent 约定）；漫画章尾残留的 "\n\n" 不再渲成"有页码的空白页"。
+  // guard 封顶：整书全是空白章时绝不死循环。
   bool okL = m_txt.renderPage(fbL, m_page);
-  while (!okL) {
+  for (uint16_t guard = 0; !okL && guard < m_nChapters; guard++) {
     Serial.printf("[epub] chapter %u exhausted/empty, advancing\n", (unsigned)m_chapter + 1);
     if (!nextChapter()) { m_ok = false; return false; }
     // 对页起点随章更新（进度存档/restartPair 要落在真正渲染的章上）
@@ -666,6 +678,7 @@ bool EpubBook::renderPair(uint8_t* fbL, uint8_t* fbR) {
     m_pairStart = m_txt.curFilePos();
     okL = m_txt.renderPage(fbL, m_page);
   }
+  if (!okL) { m_ok = false; return false; }
 
   // 右页：章末中道结束 → 空白页 + 标记下一对页进新章
   if (m_txt.hitEof()) {

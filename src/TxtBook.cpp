@@ -45,6 +45,10 @@ static bool s_pendingSpace = false;
 static long s_lineStart = 0, s_pageStart = 0;
 static long s_rewindPos = -1;   // 页尾回退位：图整页放不下时 = 图标记的文件位置
                                 // （-1 = 无。与 s_lineStart 回退互补，见 renderPage 尾部）
+static bool s_hadContent = false; // 本页是否落过实际内容（文本行/图块）。
+                                // EPUB（m_loop=false）纯空白页（只有空行/直接 EOF）
+                                // 据此返回 false → 调用方跳过该页推进，不渲
+                                // "有页码的空白页"（漫画章尾 "\n\n"，DESIGN §12）
 static TxtBook::BookImgMeasureFn s_imgMeas = nullptr;   // EPUB 插图回调（EpubBook 注册）
 static TxtBook::BookImgDrawFn s_imgDraw = nullptr;
 static void* s_imgCtx = nullptr;
@@ -179,6 +183,7 @@ static void drawAscii16x2(int x, int y, char c) {
 // 画出当前行并开新行。false = 页满不画不重置（调用方回退文件，内容不丢）
 static bool flushLine() {
   if (s_lines >= s_maxline) return false;
+  if (s_lineLen > 0) s_hadContent = true;   // 空行（无字符）不算内容
   s_line[s_lineLen] = '\0';
   int y = TXT_Y0 + s_lines * s_lineH;
   int x = TXT_X, i = 0;
@@ -332,6 +337,7 @@ static bool placeImageBlock(const char* path, int len, uint32_t wStart) {
   }
   int drawH = need * s_lineH;
   if (drawH > maxH) drawH = maxH;                    // 几何兜底（截断后应不触发）
+  s_hadContent = true;                               // 图块占位即内容（坏图在上面已 return）
   if (s_imgDraw) s_imgDraw(s_imgCtx, p, TXT_X, y, HARD_PX, drawH);
   s_lines += need;
   return true;
@@ -545,6 +551,7 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
   m_hitEof = false;
   s_lineLen = 0; s_px = 0; s_lines = 0; s_ntok = 0;
   s_pendingSpace = false;
+  s_hadContent = false;
   s_rewindPos = -1;
   s_pageStart = m_file.position();
   s_lineStart = s_pageStart;
@@ -618,7 +625,12 @@ bool TxtBook::renderPage(uint8_t* fb, uint32_t pageNo) {
   Serial.printf("[txt] page %lu: pos %ld->%ld, %d lines, %lu ms\n",
                 (unsigned long)pageNo, s_pageStart, (long)m_file.position(),
                 s_lines, (unsigned long)(millis() - t0));
-  return s_lines > 0;
+  // 返回值分两种语义：
+  //   TXT（m_loop=true）：照旧 s_lines>0（纯空行页也算一页，行为不变）；
+  //   EPUB（m_loop=false）：无内容（s_hadContent=false）→ false。纯空白页
+  //   （章尾残留 "\n\n"、空章）交给 EpubBook::renderPair 的跳过/推进逻辑，
+  //   不再占用一个面板画"有页码的空白页"（漫画对页配对的前提，DESIGN §12）
+  return m_loop ? (s_lines > 0) : s_hadContent;
 }
 
 // ==== 阅读功能（2026-10-12：进度%/目录/跳转）================================

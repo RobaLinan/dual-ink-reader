@@ -440,6 +440,10 @@ bug 已修（坑 21）→ 复烧回归通过）**：
     确认 `spiffs @0x610000/10112K`。
 
 ## 6. 本地工具
+- **漫画 EPUB 对页合并**：`python3 tools/pair_manga_epub.py <in.epub> <out.epub>`
+  （calibre 类一图一章的漫画 EPUB → 连续单图章两两合并成一章，双屏一屏对页
+  正好左右面板各一页；svg 封面页/文字章不合并。需配合 §12 固件改动，
+  2026-10-13）
 - 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB '/home/roba/Nutstore Files/我的坚果云/Projects/Personal/eink'`
 - 竖版页离屏回归（不接硬件，§3.7）：`GUI=$HOME/Arduino/libraries/ESP32epdx/src/GUI g++ -std=c++17 -I"$GUI" tools/rot_layout_test.cpp "$GUI/GUI_Paint.cpp" "$GUI/font16.cpp" -o /tmp/rot_layout_test && /tmp/rot_layout_test`
   （断言逻辑画布 480×648、最坏排版零越界、页顶朝右；改动排版常量后跑一下）
@@ -700,3 +704,36 @@ include "DbgLog.h"（各 .cpp 放**最后一条 include**，库头先展开，�
 → 进单右屏模式且热点/网页可达；/debug 显示 BUSY 电平与复位原因；复位面板
 按钮救回卡 BUSY 的屏；/debug/log 与本地串口内容一致；两屏全拔 → 自动热点
 救砖通道可达。
+
+## 12. 漫画对页排版（2026-10-13 新增，src/EpubBook.* + src/TxtBook.cpp + tools/pair_manga_epub.py）
+
+双屏对折硬件的一屏 = 左右两个面板各一页；漫画 EPUB（calibre 转换器产出）每章
+只有一张整页扫描图，直接读时一章只够画左面板，右面板只剩"页眉+页码"的空白页
+（章尾残留空行也被渲成一页）。要让一屏对页 = 漫画两页，需要书侧和固件侧配套：
+
+**书侧**（`tools/pair_manga_epub.py`，批量同一条命令）：spine 里连续的单图章
+（恰好 1 张 img、无正文、非 svg 封面）两两合并为一个 XHTML——同一 `<p>` 内两张
+`<img>` 单个空格分隔。合并后一章的文本流 = `[[img:A]] [[img:B]]␣\n`，两张整页图
+正好连续落满左右面板。奇数尾巴单图章保留（结尾右面板空白一页，符合书籍装帧）。
+
+**固件侧**（三处小改，旧书行为不退化）：
+1. `EpubBook::emitImageMarker` 图标记分隔 nl()→前 sep()/后空格：行首的图仍独占
+   行首；行内相邻图标记用空格接排。换行会先占一个空行，整页图（33 行占满）被
+   挤到下一页 → 左右配对错位（这正是初版"只改书不改固件"失败的原因）。
+   空格必须 put() 直写——走 text() 会被 pendingSpace 机制吞掉。
+2. `TxtBook::renderPage` 无内容页判定（s_hadContent）：EPUB（m_loop=false）一页
+   只有空行/直接 EOF 时返回 false。纯空白页不再占用面板画"有页码的空白页"，
+   交给 `EpubBook::renderPair` 的跳过/跳章逻辑（漫画章尾 `␣\n` 残留即此路径）。
+   TXT（m_loop=true）语义不变。s_hadContent 在 flushLine 画掉非空行、
+   placeImageBlock 图块占位时置位。
+3. `EpubBook::renderPair` 左页跳过循环加 guard 封顶（≤章数）：配合 2，整书空白章
+   时绝不死循环。
+
+**整页图几何**：扫描页 ~667×1024，面板正文 464×598px → 按宽贴满自然高 ~712px
+> 一页，页首硬压进 33 行（等比缩至 464×594 居中，两侧留白；与 P4 单图章同路径，
+宽高比不变）。合并章内第一张图在左面板页首、第二张在右面板页首，都走硬压分支。
+
+**验收**（2026-10-13）：编译 1033KB/3MB 零警告；Python 仿真全书 96 对页面板序列
+（tools/pair_manga_epub.py 的文本流 + TxtBook 分页规则复刻）：93 合并章全部
+img|img 满对，仅封面右页与奇数尾页右页共 2 张空白页，符合预期。
+**屏上待验收**：合并后的漫画 EPUB 左右配对、翻页连续、章末不卡。
