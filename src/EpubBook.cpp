@@ -44,10 +44,13 @@ class TextSink {
 public:
   bool open(fs::FS& fs, const char* path) {
     m_f = fs.open(path, FILE_WRITE);
+    if (!m_f) return false;
+    m_buf = (char*)malloc(2048);        // 堆分配：prefetch 任务栈只有 16KB，2KB 不能压栈
+    if (!m_buf) { m_f.close(); return false; }
     m_last = '\n'; m_nl = 1; m_len = 0; m_err = false;
-    return (bool)m_f;
+    return true;
   }
-  void close() { flush(); if (m_f) m_f.close(); }
+  void close() { flush(); if (m_f) m_f.close(); free(m_buf); m_buf = nullptr; }
   bool err() const { return m_err; }   // true = 有 SD 写失败，文本不完整（调用方判坏章）
 
   void put(char c) {
@@ -57,7 +60,7 @@ public:
       m_nl++;
     } else m_nl = 0;
     m_buf[m_len++] = c;
-    if (m_len >= (int)sizeof(m_buf)) flush();
+    if (m_len >= 2048) flush();
     m_last = c;
   }
   void text(const char* s) {
@@ -88,7 +91,7 @@ private:
     }
   }
   File m_f;
-  char m_buf[2048];
+  char* m_buf = nullptr;
   int m_len;
   char m_last;      // 上一个写入字符
   int m_nl;         // 尾部连续换行数（封顶 2）
@@ -170,30 +173,59 @@ static void emitImageMarker(TextSink& sink, const char* docDir, const char* src)
   sink.put(' ');
 }
 
-// 遍历 DOM 抽正文。style/script/title/head 子树整棵跳过；body 内才是书。
+// 遍历 DOM 抽正文（迭代版，显式栈代替递归）。
+// style/script/title/head 子树整棵跳过；body 内才是书。
 // <img>/<image>(svg 封面) 不抽文本，转成 [[img:...]] 标记行（图独占一行）。
-static void collectText(const XMLNode* node, TextSink& sink, bool inBody,
-                        const char* docDir) {
-  for (const XMLNode* c = node->FirstChild(); c; c = c->NextSibling()) {
-    const XMLText* t = c->ToText();
-    if (t) { if (inBody) sink.text(t->Value()); continue; }
-    const XMLElement* e = c->ToElement();
-    if (!e) continue;                          // 注释/声明/未知节点：跳过
-    const char* name = e->Name();
-    if (!name) continue;
-    if (strcmp(name, "style") == 0 || strcmp(name, "script") == 0) continue;
-    if (strcmp(name, "body") == 0) { collectText(e, sink, true, docDir); sink.nl(); continue; }
-    if (!inBody) { collectText(e, sink, false, docDir); continue; }   // head/title 等不进正文
-    if (strcmp(name, "br") == 0) { sink.nl(); continue; }
-    if (strcmp(name, "img") == 0 || strcmp(name, "image") == 0) {
-      const char* src = e->Attribute("src");
-      if (!src) src = e->Attribute("xlink:href");   // svg <image xlink:href=...>
-      if (!src) src = e->Attribute("href");
-      if (src) emitImageMarker(sink, docDir, src);
-      continue;                                     // 图元素无文本子节点
+// 递归版每层 ~48-64 字节栈帧，百层嵌套 = 5-7KB，prefetch 任务栈溢出崩 core0。
+// 迭代版每层 12 字节（Frame），256 层 = 3KB 固定数组，无递归。
+struct CtFrame { const XMLNode* node; bool inBody; bool nlAfter; };
+static void collectText(const XMLNode* root, TextSink& sink, const char* docDir) {
+  static constexpr int kMaxDepth = 256;
+  CtFrame stk[kMaxDepth];
+  int top = 0;
+  stk[top++] = { root, false, false };
+
+  while (top > 0) {
+    const XMLNode* node = stk[top - 1].node;
+    bool inBody = stk[top - 1].inBody;
+    bool nlAfter = stk[top - 1].nlAfter;
+    top--;
+
+    if (nlAfter) { sink.nl(); continue; }
+
+    for (const XMLNode* c = node->FirstChild(); c; c = c->NextSibling()) {
+      const XMLText* t = c->ToText();
+      if (t) { if (inBody) sink.text(t->Value()); continue; }
+      const XMLElement* e = c->ToElement();
+      if (!e) continue;
+      const char* name = e->Name();
+      if (!name) continue;
+      if (strcmp(name, "style") == 0 || strcmp(name, "script") == 0) continue;
+      if (strcmp(name, "body") == 0) {
+        if (top + 2 <= kMaxDepth) {
+          stk[top++] = { nullptr, true, true };   // 哨兵先入栈：子树处理完后补换行
+          stk[top++] = { e, true, false };
+        }
+        continue;
+      }
+      if (!inBody) {
+        if (top < kMaxDepth) stk[top++] = { e, false, false };
+        continue;
+      }
+      if (strcmp(name, "br") == 0) { sink.nl(); continue; }
+      if (strcmp(name, "img") == 0 || strcmp(name, "image") == 0) {
+        const char* src = e->Attribute("src");
+        if (!src) src = e->Attribute("xlink:href");
+        if (!src) src = e->Attribute("href");
+        if (src) emitImageMarker(sink, docDir, src);
+        continue;
+      }
+      if (top + 2 <= kMaxDepth) {
+        if (isBlockTag(name))
+          stk[top++] = { nullptr, true, true };   // 哨兵先入：块级标签子树处理完后补换行
+        stk[top++] = { e, true, false };
+      }
     }
-    collectText(e, sink, true, docDir);
-    if (isBlockTag(name)) sink.nl();
   }
 }
 
@@ -422,7 +454,7 @@ bool EpubBook::syncConvert(uint16_t idx, int slot) {
 // 会重新 kick。
 void EpubBook::kickAdjacent() {
   if (!s_pfTask || m_nChapters < 2) return;
-  if (net.wifiOn()) return;    // WiFi 开：core1 可能正在服务网页读 SD——双核戳卡不抢
+  //if (net.wifiOn()) return;    // WiFi 开：可能正在服务网页读 SD——不抢
   if (CJK.sdOpen()) return;    // 字库流式模式：渲染期也在读 SD——同上
   for (int d = -1; d <= 1; d += 2) {
     uint16_t idx = (uint16_t)((m_chapter + m_nChapters + d) % m_nChapters);
@@ -460,24 +492,21 @@ void EpubBook::kickAdjacent() {
 void EpubBook::pfEnsure() {
   prefetchInit();                    // 幂等：同步原语（mutex/queue）未建则建
   if (s_pfTask) return;              // 任务已在
-  // 坑 25（修正）：任务创建必须在 WiFi 连接完成之后。WiFi 连接期间 core0 持跨核
-  // 自旋锁跑长临界区，此时向 core0 建任务 = 永久自旋（开机卡死无输出）。
-  // kickAdjacent() 已门控 wifiOn()，故此处 WiFi 必关，core0 空闲可建任务。
-  if (net.wifiOn()) return;          // 防御：WiFi 开 = core0 不空闲，等下次 kick
-  if (xTaskCreatePinnedToCore(pfTask, "epubpf", 8192, nullptr, 1, &s_pfTask, 0)
+  s_pfBook = this;
+  // 任务 pinned 到 core1（与 m_zip 同核，SD File 句柄有效），独立 32KB 栈
+  // （loopTask 只有 8KB，pfConvert 的 XMLDocument::Parse 递归需要 ~10KB）
+  if (xTaskCreatePinnedToCore(pfTask, "epubpf", 32768, nullptr, 1, &s_pfTask, 1)
       != pdPASS) {
     s_pfTask = nullptr;
+    s_pfBook = nullptr;
     Serial.println("WARN: prefetch task create failed - cache disabled");
   }
-  s_pfBook = this;
 }
 
 void EpubBook::prefetchInit() {
   if (s_mu) return;   // 幂等：同步原语已建
-  // 坑 25：必须在 WiFi 启动前（setup 早期）调用。
-  // 仅建同步原语（mutex/queue）；core0 任务延迟到 pfEnsure()（kickAdjacent 调用、
-  // WiFi 已关时）创建 —— WiFi 连接期间向 core0 建任务会撞 scheduler 自旋锁导致
-  // 开机卡死
+  // 仅建同步原语（mutex/queue）；任务延迟到 pfEnsure() 创建（pinned core1，
+  // 独立 32KB 栈，与 m_zip 同核共享 SD File 句柄）
   s_mu = xSemaphoreCreateMutex();
   s_sdMu = xSemaphoreCreateRecursiveMutex();
   s_pfQueue = xQueueCreate(4, sizeof(PfReq));
@@ -506,20 +535,18 @@ void EpubBook::pfFinish(int slot, uint32_t gen, uint16_t ch, bool ok) {
   // 不归我（换书/驱逐已完成）：状态已被别人接管，文件由新主人截断覆盖，什么都不做
 }
 
-// 预取任务体（core0）：独立 zip 实例 + XHTML 整条目进 PSRAM（免临时文件、不与主核
-// 撞名），解析/落盘阶段不碰 SD。任何阶段发现"槽位不归我这单"立即丢弃——期间可能
-// 已换书或跳转，半成品文件留给复用方截断。SD 读失败不自救（Storage::recover 是
-// 全局操作，留给主核同步路径统一处理），本单作废即可。
+// 预取任务体（core1，独立 32KB 栈）：复用主核 m_zip（同核 SD File 句柄有效），
+// s_sdMu 与主核串行。解析/落盘阶段不碰 SD。任何阶段发现"槽位不归我这单"
+// 立即丢弃——期间可能已换书或跳转，半成品文件留给复用方截断。
 bool EpubBook::pfConvert(uint16_t idx, int slot, uint32_t gen) {
   uint32_t t0 = millis();
   char* buf = nullptr;
   size_t blen = 0;
   bool ok = false;
   {
-    SdMuGuard sdGuard;
-    EpubZip zip;   // miniz 流 per-instance，与主核 m_zip 并发互不干扰
-    if (zip.open(m_path))
-      ok = zip.extractToBuffer(m_chapterPath[idx], &buf, &blen, PF_MAX_XHTML);
+    SdMuGuard sdGuard;                // 与主核 m_zip 串行（同一 SD 句柄，不开第二个）
+    if (m_zip.isOpen())
+      ok = m_zip.extractToBuffer(m_chapterPath[idx], &buf, &blen, PF_MAX_XHTML);
   }
   if (!ok || !buf) { free(buf); return false; }
   if (!pfMine(slot, gen, idx)) { free(buf); return false; }
@@ -538,7 +565,7 @@ bool EpubBook::pfConvert(uint16_t idx, int slot, uint32_t gen) {
       dirOf(m_chapterPath[idx], docDir, sizeof(docDir));
       TextSink sink;
       if (sink.open(tempFs(), SLOT_PATH[slot])) {
-        collectText(&doc, sink, false, docDir);
+        collectText(&doc, sink, docDir);
         sink.close();
         ok = !sink.err();
       }
@@ -842,7 +869,7 @@ bool EpubBook::convertChapterToText(const char* docDir, const char* xhtmlPath,
     if (doc.Parse(start) == XML_SUCCESS) {
       TextSink sink;
       if (sink.open(tempFs(), txtPath)) {
-        collectText(&doc, sink, false, docDir);
+        collectText(&doc, sink, docDir);
         sink.close();
         ok = !sink.err();          // 临时文件写停摆 → 文本不完整 → 判坏章
         if (!ok) Serial.println("WARN: chapter text write failed");

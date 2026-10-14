@@ -666,8 +666,8 @@ void setup() {
                 (unsigned)ESP.getFreeHeap());
   prefs.begin("eink-book");
 
-  // EPUB core0 预取：建同步原语（mutex/queue），core0 任务延迟到 kickAdjacent()
-  // 首次调用且 WiFi 关闭时才创建（坑 25：WiFi 连接期间向 core0 建任务 = 死锁）
+  // EPUB 预取：建同步原语（mutex/queue），任务延迟到 pfEnsure() 创建
+  // （pinned core1，独立 32KB 栈，与 m_zip 同核共享 SD File 句柄）
   EpubBook::prefetchInit();
 
   // 系统网络服务（菜单后端）：自带 NVS 命名空间 "eink-net"，WiFi 默认关

@@ -20,6 +20,7 @@ public:
   // 文件在片内 LittleFS，此值几乎不再出现，保留语义）；条目缺失/校验败与写无关。
   enum ExtractFail { EXFAIL_NONE = 0, EXFAIL_ENTRY, EXFAIL_IO, EXFAIL_VERIFY };
 
+  ~EpubZip() { close(); }
   bool open(const char* path);          // false = 打不开/不是 zip
   void close();
   bool isOpen() const { return m_ok; }

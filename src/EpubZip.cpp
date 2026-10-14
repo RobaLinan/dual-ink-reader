@@ -163,34 +163,11 @@ bool EpubZip::extractToFile(const char* zipPath, const char* outPath, fs::FS& ou
   return true;
 }
 
-// ---- extractToBuffer：块回调累积到 PSRAM 增长缓冲（epub 预取任务用，见 EpubBook）----
-namespace {
-
-struct PsrBuf {
-  char* p = nullptr;
-  size_t len = 0, cap = 0, maxBytes = 0;
-  bool bad = false;   // 超限/分配失败：回调返回 0 让 miniz 中止
-};
-
-size_t psrBufWrite(void* opaque, mz_uint64 ofs, const void* buf, size_t n) {
-  (void)ofs;
-  PsrBuf* b = (PsrBuf*)opaque;
-  if (b->len + n + 1 > b->maxBytes) { b->bad = true; return 0; }
-  if (b->len + n + 1 > b->cap) {
-    size_t nc = b->cap ? b->cap : 32768;
-    while (nc < b->len + n + 1) nc *= 2;
-    char* np = (char*)heap_caps_realloc(b->p, nc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!np) { b->bad = true; return 0; }
-    b->p = np; b->cap = nc;
-  }
-  memcpy(b->p + b->len, buf, n);
-  b->len += n;
-  b->p[b->len] = '\0';
-  return n;
-}
-
-}  // namespace
-
+// ---- extractToBuffer：迭代式 API 累积到 PSRAM 增长缓冲（预取任务用，见 EpubBook）----
+// 同 extractToFile 用迭代式 API（坑 16/17）：tinfl_decompressor ~8.2KB 堆分配而非栈上，
+// 32 位越界写落在堆（+4096 slack 兜底）而非栈帧 → 不踩返回地址/寄存器保存区。
+// extract_to_callback 把 tinfl_decompressor 放栈上，32KB 栈也扛不住 32 位溢出模式踩的
+// 确定性地址 0x120d0e07（EXCVADDR = A2 = A5，每次必现）。
 bool EpubZip::extractToBuffer(const char* zipPath, char** outBuf, size_t* outLen,
                               size_t maxBytes) {
   if (outBuf) *outBuf = nullptr;
@@ -201,23 +178,53 @@ bool EpubZip::extractToBuffer(const char* zipPath, char** outBuf, size_t* outLen
   mz_zip_archive_file_stat st;
   if (mz_zip_reader_file_stat((mz_zip_archive*)m_zip, idx, &st) &&
       (uint64_t)st.m_uncomp_size + 1 > maxBytes) {
-    m_fail = EXFAIL_ENTRY;   // 条目太大：留给主核流式落盘路径（不算缺失）
+    m_fail = EXFAIL_ENTRY;
     return false;
   }
-  PsrBuf acc;
-  acc.maxBytes = maxBytes;
-  if (!mz_zip_reader_extract_to_callback((mz_zip_archive*)m_zip, (mz_uint)idx,
-                                         psrBufWrite, &acc, 0)) {
-    free(acc.p);
-    m_fail = acc.bad ? EXFAIL_IO : EXFAIL_VERIFY;
+
+  mz_zip_reader_extract_iter_state* it =
+      mz_zip_reader_extract_iter_new((mz_zip_archive*)m_zip, (mz_uint)idx, 0);
+  if (!it) { m_fail = EXFAIL_ENTRY; return false; }
+
+  size_t cap = 0, len = 0;
+  char* buf = nullptr;
+  uint8_t rbuf[1024];
+  uint32_t own_crc = 0;
+  bool failed = false;
+
+  for (;;) {
+    size_t n = mz_zip_reader_extract_iter_read(it, rbuf, sizeof(rbuf));
+    if (!n) break;
+    if (failed) continue;
+    if (len + n + 1 > maxBytes) { failed = true; continue; }
+    if (len + n + 1 > cap) {
+      size_t nc = cap ? cap * 2 : 32768;
+      while (nc < len + n + 1) nc *= 2;
+      char* np = (char*)heap_caps_realloc(buf, nc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!np) { failed = true; continue; }
+      buf = np; cap = nc;
+    }
+    memcpy(buf + len, rbuf, n);
+    len += n;
+    own_crc = (uint32_t)mz_crc32(own_crc, rbuf, n);
+  }
+
+  it->file_crc32 = own_crc;   // 坑 17：tinfl 32 位越界踩 file_crc32，外部重算回填
+  mz_bool ok = mz_zip_reader_extract_iter_free(it);
+
+  if (!ok || failed) {
+    free(buf);
+    m_fail = failed ? EXFAIL_IO : EXFAIL_VERIFY;
     return false;
   }
-  if (!acc.p) {   // 空条目：给有效空缓冲，调用方按 0 长处理
-    acc.p = (char*)ps_malloc(1);
-    if (!acc.p) { m_fail = EXFAIL_IO; return false; }
-    acc.p[0] = '\0';
+  if (!buf) {
+    buf = (char*)ps_malloc(1);
+    if (!buf) { m_fail = EXFAIL_IO; return false; }
+    buf[0] = '\0';
+  } else {
+    buf[len] = '\0';
   }
-  *outBuf = acc.p;
-  *outLen = acc.len;
+  *outBuf = buf;
+  *outLen = len;
   return true;
 }
