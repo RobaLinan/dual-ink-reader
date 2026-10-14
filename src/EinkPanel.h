@@ -29,6 +29,12 @@
 #ifndef PAGE_ROTATE
 #define PAGE_ROTATE 90
 #endif
+// SPI 时钟。原跑 10MHz，左屏间歇 BUSY 超时疑似链路信号完整性边界问题
+// （降频后若稳定 = 诱因在此）。编译期可用 -DEINK_SPI_HZ=10000000 切回 10MHz
+#ifndef EINK_SPI_HZ
+#define EINK_SPI_HZ 4000000
+#endif
+
 class EinkPanel {
 public:
   enum Speed : uint8_t { FULL = 0, FAST = 1, PARTIAL = 2 };

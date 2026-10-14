@@ -24,6 +24,9 @@ public:
   Result key(char c);                              // 菜单内按键分发
   void draw(uint8_t* fbL, uint8_t* fbR, int libCount);  // 画进左右 draw 缓冲
 
+  void (*onFullEvery)() = nullptr;   // "全刷间隔"项执行回调（eink.ino 设置）
+  int fullEvery = 5;                 // 当前全刷间隔值（eink.ino 同步，draw 显示用）
+
 private:
   Result activate();                               // 执行当前选中项
   void drawLeft();

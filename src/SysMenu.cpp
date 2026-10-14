@@ -10,11 +10,11 @@
 
 SysMenu menu;
 
-static const int kItems = 4;
+static const int kItems = 5;
 static const uint32_t NL_WINDOW_MS = 400;   // 命令尾换行的吞掉窗口
 
 static const char* kLabel[kItems] = {
-  "WiFi 配置", "WiFi 开关", "OTA 更新", "电子书上传服务",
+  "WiFi 配置", "WiFi 开关", "OTA 更新", "电子书上传服务", "全刷间隔",
 };
 
 // 选中项的两行说明（屏上"执行前先看一眼这行是干嘛的"）
@@ -23,6 +23,7 @@ static const char* kHint[kItems][2] = {
   { "总开关：开=连路由器或", "开热点，关=断电省电(默认)" },
   { "开=arduino-cli 网络上传", "  + 网页 /update 传 bin" },
   { "开=网页上传/管理书库", "（/upload /library，需先开 WiFi）" },
+  { "每 N 次快刷插 1 次全刷", "选中按空格 5→6→...→15→5" },
 };
 
 // ---- 绘制辅助 ----（已抽到 UiDraw.h/.cpp：utf8At / drawUtf8 / drawCjkStr / drawBorder）
@@ -37,7 +38,7 @@ void SysMenu::drawLeft() {
   drawThickRule(24, 62, EinkPanel::PAGE_W - 24);
 
   for (int i = 0; i < kItems; i++) {
-    int y = 82 + i * 52;
+    int y = 82 + i * 48;
     bool sel = (i == m_sel);
     if (sel) {
       drawSelectArrow(24, y);          // 左侧实心三角
@@ -46,24 +47,30 @@ void SysMenu::drawLeft() {
     int textX = sel ? 42 : 36;
     drawUtf8(textX, y, row.c_str(), EinkPanel::PAGE_W - 80);
     // 状态指示点 + 状态文字
-    bool on = false;
-    switch (i) {
-      case 0: on = net.portalUp() || net.staSsid()[0]; break;
-      case 1: on = net.wifiOn(); break;
-      case 2: on = net.otaOn(); break;
-      case 3: on = net.upOn(); break;
-    }
     int dotX = EinkPanel::PAGE_W - 70;
-    drawStatusDot(dotX, y, on);
-    // 状态文字
-    const char* stxt = "";
-    switch (i) {
-      case 0: stxt = net.portalUp() ? "热点" : (net.staSsid()[0] ? "已配" : "未配"); break;
-      case 1: stxt = net.wifiOn() ? "开" : "关"; break;
-      case 2: stxt = net.otaOn() ? "开" : "关"; break;
-      case 3: stxt = net.upOn() ? "开" : "关"; break;
+    if (i < 4) {
+      bool on = false;
+      switch (i) {
+        case 0: on = net.portalUp() || net.staSsid()[0]; break;
+        case 1: on = net.wifiOn(); break;
+        case 2: on = net.otaOn(); break;
+        case 3: on = net.upOn(); break;
+      }
+      drawStatusDot(dotX, y, on);
+      const char* stxt = "";
+      switch (i) {
+        case 0: stxt = net.portalUp() ? "热点" : (net.staSsid()[0] ? "已配" : "未配"); break;
+        case 1: stxt = net.wifiOn() ? "开" : "关"; break;
+        case 2: stxt = net.otaOn() ? "开" : "关"; break;
+        case 3: stxt = net.upOn() ? "开" : "关"; break;
+      }
+      drawUtf8(dotX + 12, y, stxt, EinkPanel::PAGE_W - 32);
+    } else {
+      // 全刷间隔：显示数字
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", fullEvery);
+      drawUtf8(dotX, y, buf, EinkPanel::PAGE_W - 32);
     }
-    drawUtf8(dotX + 12, y, stxt, EinkPanel::PAGE_W - 32);
     if (sel) {
       drawSelectBar(textX, y + 21, EinkPanel::PAGE_W - 48);
     }
@@ -122,6 +129,10 @@ void SysMenu::drawRight(int libCount) {
   s = F("书库: ");
   s += String(libCount);
   s += F(" 本");
+  line(s);
+  s = F("全刷间隔: 每 ");
+  s += String(fullEvery);
+  s += F(" 次快刷");
   line(s);
 
   // 网页地址区
@@ -190,6 +201,7 @@ SysMenu::Result SysMenu::activate() {
     case 1: net.setWifiOn(!net.wifiOn()); break;      // WiFi 开关
     case 2: net.setOtaOn(!net.otaOn()); break;        // OTA 开关
     case 3: net.setUpOn(!net.upOn()); break;          // 上传服务开关
+    case 4: if (onFullEvery) onFullEvery(); break;    // 全刷间隔循环
   }
   return REDRAW;
 }

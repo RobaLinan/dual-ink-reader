@@ -29,6 +29,12 @@ public:
   // 目标文件已存在则截断覆盖。
   bool extractToFile(const char* zipPath, const char* outPath, fs::FS& outFs);
 
+  // 解压条目到 PSRAM 连续缓冲（调用方负责 free），后台预取任务专用：
+  // 免临时文件（不与主核的 XHTML 临时文件撞名/竞争），代价 = 整条目驻留 PSRAM——
+  // 超过 maxBytes 直接失败（调用方退回 extractToFile 流式落盘路径）。块回调累积到
+  // ps_malloc/realloc 增长缓冲；CRC/尺寸校验由 miniz 收尾保留。
+  bool extractToBuffer(const char* zipPath, char** outBuf, size_t* outLen, size_t maxBytes);
+
   // 条目原始大小（解压后），-1 = 无此条目
   long entrySize(const char* zipPath);
 

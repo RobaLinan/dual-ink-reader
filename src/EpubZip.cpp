@@ -162,3 +162,62 @@ bool EpubZip::extractToFile(const char* zipPath, const char* outPath, fs::FS& ou
                 zipPath, entrySize(zipPath), (unsigned long)(millis() - t0));
   return true;
 }
+
+// ---- extractToBuffer：块回调累积到 PSRAM 增长缓冲（epub 预取任务用，见 EpubBook）----
+namespace {
+
+struct PsrBuf {
+  char* p = nullptr;
+  size_t len = 0, cap = 0, maxBytes = 0;
+  bool bad = false;   // 超限/分配失败：回调返回 0 让 miniz 中止
+};
+
+size_t psrBufWrite(void* opaque, mz_uint64 ofs, const void* buf, size_t n) {
+  (void)ofs;
+  PsrBuf* b = (PsrBuf*)opaque;
+  if (b->len + n + 1 > b->maxBytes) { b->bad = true; return 0; }
+  if (b->len + n + 1 > b->cap) {
+    size_t nc = b->cap ? b->cap : 32768;
+    while (nc < b->len + n + 1) nc *= 2;
+    char* np = (char*)heap_caps_realloc(b->p, nc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!np) { b->bad = true; return 0; }
+    b->p = np; b->cap = nc;
+  }
+  memcpy(b->p + b->len, buf, n);
+  b->len += n;
+  b->p[b->len] = '\0';
+  return n;
+}
+
+}  // namespace
+
+bool EpubZip::extractToBuffer(const char* zipPath, char** outBuf, size_t* outLen,
+                              size_t maxBytes) {
+  if (outBuf) *outBuf = nullptr;
+  if (!m_ok || !outBuf || !outLen) return false;
+  m_fail = EXFAIL_NONE;
+  int idx = mz_zip_reader_locate_file((mz_zip_archive*)m_zip, zipPath, NULL, 0);
+  if (idx < 0) { m_fail = EXFAIL_ENTRY; return false; }
+  mz_zip_archive_file_stat st;
+  if (mz_zip_reader_file_stat((mz_zip_archive*)m_zip, idx, &st) &&
+      (uint64_t)st.m_uncomp_size + 1 > maxBytes) {
+    m_fail = EXFAIL_ENTRY;   // 条目太大：留给主核流式落盘路径（不算缺失）
+    return false;
+  }
+  PsrBuf acc;
+  acc.maxBytes = maxBytes;
+  if (!mz_zip_reader_extract_to_callback((mz_zip_archive*)m_zip, (mz_uint)idx,
+                                         psrBufWrite, &acc, 0)) {
+    free(acc.p);
+    m_fail = acc.bad ? EXFAIL_IO : EXFAIL_VERIFY;
+    return false;
+  }
+  if (!acc.p) {   // 空条目：给有效空缓冲，调用方按 0 长处理
+    acc.p = (char*)ps_malloc(1);
+    if (!acc.p) { m_fail = EXFAIL_IO; return false; }
+    acc.p[0] = '\0';
+  }
+  *outBuf = acc.p;
+  *outLen = acc.len;
+  return true;
+}

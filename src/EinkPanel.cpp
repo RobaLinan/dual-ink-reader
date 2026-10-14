@@ -28,7 +28,9 @@ bool EinkPanel::begin() {
     }
     s_spiBegun = true;
   }
-  pinMode(m_busy, INPUT);
+  // 上拉：面板未上电/复位失败时 BUSY 是浮空线，裸 INPUT 会随机读到 LOW，
+  // 表现为"时好时坏的 BUSY 超时"。UC8179 的 BUSY 为推挽输出，上拉无副作用
+  pinMode(m_busy, INPUT_PULLUP);
   pinMode(m_rst, OUTPUT);
   pinMode(m_dc, OUTPUT);
   pinMode(m_cs, OUTPUT);
@@ -149,7 +151,7 @@ bool EinkPanel::wake() {
 }
 
 void EinkPanel::writeCmd(uint8_t c) {
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(EINK_SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(m_cs, LOW);
   digitalWrite(m_dc, LOW);
   SPI.transfer(c);
@@ -158,7 +160,7 @@ void EinkPanel::writeCmd(uint8_t c) {
 }
 
 void EinkPanel::writeData(uint8_t d) {
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(EINK_SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(m_cs, LOW);
   digitalWrite(m_dc, HIGH);
   SPI.transfer(d);
@@ -167,7 +169,7 @@ void EinkPanel::writeData(uint8_t d) {
 }
 
 void EinkPanel::writeDataBurst(const uint8_t* data, size_t len) {
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(EINK_SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(m_cs, LOW);
   digitalWrite(m_dc, HIGH);
   SPI.writeBytes(const_cast<uint8_t*>(data), len);

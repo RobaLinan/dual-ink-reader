@@ -4,6 +4,7 @@
 #include "EinkPanel.h"
 #include "CjkFont.h"
 #include "EpubImg.h"
+#include "NetSvc.h"   // net.wifiOn()：预取门控（WiFi 开 = core1 可能在服务网页读 SD）
 #include <ESP32epdx.h>
 #include <LittleFS.h>
 #include <string.h>
@@ -31,8 +32,7 @@ static fs::FS& tempFs() {
 // EPUB 临时文件（LittleFS 根目录，__ 前缀避免和书库扫描撞车）
 static const char* TEMP_CONTAINER = "/__c.xml";
 static const char* TEMP_OPF       = "/__o.opf";
-static const char* TEMP_XHTML     = "/__e.xhtml";
-static const char* TEMP_TXT       = "/__e.txt";
+static const char* TEMP_XHTML     = "/__e.xhtml";   // 主核同步转换的 XHTML 临时文件
 static const char* TEMP_IMG       = "/__i.bin";   // 插图（解压到渲染同一张时复用）
 static const char* TEMP_NCX       = "/__t.ncx";   // 目录源（NCX 或 nav.xhtml 共用）
 
@@ -109,6 +109,8 @@ static bool isBlockTag(const char* n) {
 // ---- EPUB 插图标记：src(href) → zip 内路径 → 写 [[img:path]] 独占一行 ----
 // percentDecode 定义在本文件后部，先给原型（emitImageMarker 只在转换路径被调）
 static void percentDecode(char* s);
+// dirOf 定义在本文件后部（目录解析用），loadChapter/syncConvert 复用先给原型
+static void dirOf(const char* zipPath, char* out, size_t n);
 
 // 解析相对 href → 规范化 zip 内路径（'#' 锚截掉、./ 与 ../ 折叠、%XX 解码）。
 // 与 emitImageMarker 同一套规则，目录 NCX/nav 的 content src / a href 复用。
@@ -276,10 +278,300 @@ static void percentDecode(char* s) {
   *w = '\0';
 }
 
+// ==== 双核章节缓存（DESIGN §13）：core0 预取"转换后的章文本"，翻章 = 开文件 ====
+// 背景：loadChapter 同步路径（zip 解压 + XML 解析 + LittleFS 落盘）大章节几秒到
+// 十几秒（坑 23），跨章翻页/回退可感知卡顿。S3 的 core0 全程闲着 → 后台任务把
+// 当前章前后各一章提前转换进 3 个轮换槽位；主核命中 READY 槽 = 打开文件（毫秒级）。
+//
+// 槽位状态机（s_mu 保护）：IDLE(0) → WRITING(2) → READY(1)；ch = 槽内章号（-1 无）。
+//   主核：acquireSlot 里 READY 命中直用 / 未命中占 IDLE 同步转换；kickAdjacent 占
+//         IDLE 或驱逐"离目标章最远"的非当前章 READY 槽（复用即 FILE_WRITE 截断，
+//         旧文件内容无关紧要，无需先删）。
+//   WRITING 槽绝不驱逐：恰是目标章就等它就绪，否则等它落定再动池子（主核
+//         syncConvert 与任务 pfConvert 都会 finalize，无死锁）。
+//   当前章槽（m_curSlot，m_txt 正开着它）绝不驱逐/复用。
+// 代际 m_gen：open/close 自增 + clearSlots；任务在飞请求经 (gen,slot,ch) 三重校验，
+//   陈旧单自然作废（槽位已被清成 IDLE，任务 finalize 时发现"不归我"就放手；其残
+//   留的半成品文件由下一次复用 FILE_WRITE 截断覆盖，最多占 3 个槽位体积）。
+// SD 串行：s_sdMu 递归互斥。ESP-IDF 4.4 的 SDMMC 卡命令路径没有会话锁，双核并发
+//   戳卡会互踩命令 → 所有 zip/SD 访问（含 extractWithRecovery 自救与主核 open
+//   全程）持锁；预取任务的解压同理。LittleFS/PSRAM 分配器自身线程安全，不加锁。
+// 门控：WiFi 开（core1 可能在服务网页读 SD）或字库流式模式（渲染期也在读 SD）时
+//   不发起预取，翻章退回原同步路径（行为同本缓存不存在）。
+
+// 静态成员定义（类内声明见头文件）
+SemaphoreHandle_t EpubBook::s_mu = nullptr;
+SemaphoreHandle_t EpubBook::s_sdMu = nullptr;
+TaskHandle_t EpubBook::s_pfTask = nullptr;
+QueueHandle_t EpubBook::s_pfQueue = nullptr;
+EpubBook::SlotState EpubBook::s_slot[EpubBook::NSLOT] = {};
+EpubBook* EpubBook::s_pfBook = nullptr;
+
+// 3 槽 LittleFS 文本槽位（"__" 前缀避开书库扫描；≤444KB×3 ≈ 1.3MB，3.5MB 分区够）
+static const char* const SLOT_PATH[3] = { "/__s0.txt", "/__s1.txt", "/__s2.txt" };
+static_assert(EpubBook::NSLOT == 3, "SLOT_PATH 与 NSLOT 同步改");
+static const size_t PF_MAX_XHTML = 2 * 1024 * 1024;  // 预取任务 XHTML 进 PSRAM 的上限
+                                                     // （实测有书单章 1.2MB，1MB 上限会整章放弃）
+
+// SD 访问锁 RAII（递归互斥：open() 全程持锁时内层 extractWithRecovery 再取不互斥）
+// 注意：s_sdMu 是 xSemaphoreCreateRecursiveMutex() 创建的，必须用 TakeRecursive/
+// GiveRecursive —— FreeRTOS 文档明确说对递归互斥量用普通 xSemaphoreTake 是未定义行为
+struct EpubBook::SdMuGuard {
+  SdMuGuard()  { if (s_sdMu) xSemaphoreTakeRecursive(s_sdMu, portMAX_DELAY); }
+  ~SdMuGuard() { if (s_sdMu) xSemaphoreGiveRecursive(s_sdMu); }
+};
+
+// 章号距离（驱逐挑"最远"用；回卷书 abs 差足够，不做环形距离）
+static uint16_t chDist(int16_t a, uint16_t b) {
+  int d = (int)a - (int)b;
+  return (uint16_t)(d < 0 ? -d : d);
+}
+
+void EpubBook::clearSlots() {
+  xSemaphoreTake(s_mu, portMAX_DELAY);
+  for (int i = 0; i < NSLOT; i++) { s_slot[i].state = 0; s_slot[i].ch = -1; }
+  m_curSlot = -1;
+  xSemaphoreGive(s_mu);
+  for (int i = 0; i < NSLOT; i++) tempFs().remove(SLOT_PATH[i]);
+}
+
+void EpubBook::evictSlot(int slot) {
+  xSemaphoreTake(s_mu, portMAX_DELAY);
+  if (s_slot[slot].state == 1) { s_slot[slot].state = 0; s_slot[slot].ch = -1; }
+  xSemaphoreGive(s_mu);
+  // 文件不删：下次复用 FILE_WRITE 截断覆盖
+}
+
+void EpubBook::invalidateOtherSlots() {
+  xSemaphoreTake(s_mu, portMAX_DELAY);
+  for (int i = 0; i < NSLOT; i++)
+    if (i != m_curSlot && s_slot[i].state == 1) { s_slot[i].state = 0; s_slot[i].ch = -1; }
+  xSemaphoreGive(s_mu);
+  for (int i = 0; i < NSLOT; i++)
+    if (i != m_curSlot) tempFs().remove(SLOT_PATH[i]);
+}
+
+// 主核：为第 idx 章拿到一个 READY 槽。命中即用；未命中选槽同步转换（慢路径）。
+// 选槽优先级：IDLE > 驱逐最远 READY；WRITING 绝不驱逐——是目标章就等它就绪
+// （预取刚好在跑同一章，最常见），不是就等它落定回头重选。
+int EpubBook::acquireSlot(uint16_t idx) {
+  const uint32_t t0 = millis();
+  for (;;) {
+    int hit = -1, wTarget = -1, idle = -1, farReady = -1;
+    uint16_t farD = 0;
+    xSemaphoreTake(s_mu, portMAX_DELAY);
+    for (int i = 0; i < NSLOT; i++) {
+      const int16_t ch = s_slot[i].ch;
+      if (s_slot[i].state == 1 && ch == (int16_t)idx) hit = i;
+      if (s_slot[i].state == 2 && ch == (int16_t)idx) wTarget = i;
+      if (s_slot[i].state == 0 && i != m_curSlot) idle = i;
+      if (s_slot[i].state == 1 && i != m_curSlot) {
+        uint16_t d = chDist(ch, idx);
+        if (farReady < 0 || d > farD) { farReady = i; farD = d; }
+      }
+    }
+    if (hit >= 0) {
+      xSemaphoreGive(s_mu);
+      if (millis() - t0 > 50)
+        Serial.printf("[epub] ch%u cache wait %lu ms\n",
+                      (unsigned)idx + 1, (unsigned long)(millis() - t0));
+      return hit;
+    }
+    if (idle >= 0) {
+      s_slot[idle].state = 2; s_slot[idle].ch = (int16_t)idx;   // 主核占位 WRITING
+      xSemaphoreGive(s_mu);
+      bool ok = syncConvert(idx, idle);
+      xSemaphoreTake(s_mu, portMAX_DELAY);
+      s_slot[idle].state = ok ? 1 : 0;
+      if (!ok) s_slot[idle].ch = -1;
+      xSemaphoreGive(s_mu);
+      return ok ? idle : -1;
+    }
+    const int wait = (wTarget >= 0) ? wTarget : farReady;  // farReady=-1 → 非当前槽全在写
+    xSemaphoreGive(s_mu);
+    if (farReady >= 0 && wTarget < 0) { evictSlot(farReady); continue; }
+    uint32_t start = millis();
+    bool settled = false;
+    while (millis() - start < 20000) {
+      delay(50);
+      xSemaphoreTake(s_mu, portMAX_DELAY);
+      int8_t st = s_slot[wait].state;
+      xSemaphoreGive(s_mu);
+      if (st != 2) { settled = true; break; }
+    }
+    if (!settled) Serial.println("WARN: slot wait timeout - retrying");
+    // 落定（或超时）后回头重选：WRITING→READY 可能正是目标章，池子状态已变
+  }
+}
+
+// 主核慢路径：解压 + 转换写进指定槽（原 loadChapter 的路径，语义一字未改）
+bool EpubBook::syncConvert(uint16_t idx, int slot) {
+  if (!extractWithRecovery(m_chapterPath[idx], TEMP_XHTML)) {
+    Serial.printf("WARN: extract failed: %s\n", m_chapterPath[idx]);
+    return false;
+  }
+  char docDir[64];
+  dirOf(m_chapterPath[idx], docDir, sizeof(docDir));
+  bool ok = convertChapterToText(docDir, TEMP_XHTML, SLOT_PATH[slot]);
+  tempFs().remove(TEMP_XHTML);
+  return ok;
+}
+
+// 主核：把当前章前后章的转换请求发给预取任务。无 IDLE 槽时驱逐最远就绪槽
+// （持续前进/后退时让缓存始终指着行进方向）。请求丢失/被拒无害：下次 loadChapter
+// 会重新 kick。
+void EpubBook::kickAdjacent() {
+  if (!s_pfTask || m_nChapters < 2) return;
+  if (net.wifiOn()) return;    // WiFi 开：core1 可能正在服务网页读 SD——双核戳卡不抢
+  if (CJK.sdOpen()) return;    // 字库流式模式：渲染期也在读 SD——同上
+  for (int d = -1; d <= 1; d += 2) {
+    uint16_t idx = (uint16_t)((m_chapter + m_nChapters + d) % m_nChapters);
+    if (idx == m_chapter) continue;
+    int slot = -1;
+    xSemaphoreTake(s_mu, portMAX_DELAY);
+    bool have = false;
+    int idle = -1, farReady = -1;
+    uint16_t farD = 0;
+    for (int i = 0; i < NSLOT; i++) {
+      const int16_t ch = s_slot[i].ch;
+      if (s_slot[i].state != 0 && ch == (int16_t)idx) have = true;
+      if (s_slot[i].state == 0) idle = i;
+      else if (s_slot[i].state == 1 && i != m_curSlot) {
+        uint16_t dd = chDist(ch, idx);
+        if (farReady < 0 || dd > farD) { farReady = i; farD = dd; }
+      }
+    }
+    if (!have) slot = (idle >= 0) ? idle : farReady;
+    if (slot >= 0) { s_slot[slot].state = 2; s_slot[slot].ch = (int16_t)idx; }
+    xSemaphoreGive(s_mu);
+    if (slot < 0) continue;
+    PfReq r = { m_gen, idx, (int8_t)slot };
+    if (xQueueSend(s_pfQueue, &r, 0) != pdTRUE) {
+      // 队列满（前一单还没消费）：撤回占位，下次转换时自然重试
+      xSemaphoreTake(s_mu, portMAX_DELAY);
+      if (s_slot[slot].state == 2 && s_slot[slot].ch == (int16_t)idx) {
+        s_slot[slot].state = 0; s_slot[slot].ch = -1;
+      }
+      xSemaphoreGive(s_mu);
+    }
+  }
+}
+
+void EpubBook::pfEnsure() {
+  prefetchInit();                    // 幂等：同步原语（mutex/queue）未建则建
+  if (s_pfTask) return;              // 任务已在
+  // 坑 25（修正）：任务创建必须在 WiFi 连接完成之后。WiFi 连接期间 core0 持跨核
+  // 自旋锁跑长临界区，此时向 core0 建任务 = 永久自旋（开机卡死无输出）。
+  // kickAdjacent() 已门控 wifiOn()，故此处 WiFi 必关，core0 空闲可建任务。
+  if (net.wifiOn()) return;          // 防御：WiFi 开 = core0 不空闲，等下次 kick
+  if (xTaskCreatePinnedToCore(pfTask, "epubpf", 8192, nullptr, 1, &s_pfTask, 0)
+      != pdPASS) {
+    s_pfTask = nullptr;
+    Serial.println("WARN: prefetch task create failed - cache disabled");
+  }
+  s_pfBook = this;
+}
+
+void EpubBook::prefetchInit() {
+  if (s_mu) return;   // 幂等：同步原语已建
+  // 坑 25：必须在 WiFi 启动前（setup 早期）调用。
+  // 仅建同步原语（mutex/queue）；core0 任务延迟到 pfEnsure()（kickAdjacent 调用、
+  // WiFi 已关时）创建 —— WiFi 连接期间向 core0 建任务会撞 scheduler 自旋锁导致
+  // 开机卡死
+  s_mu = xSemaphoreCreateMutex();
+  s_sdMu = xSemaphoreCreateRecursiveMutex();
+  s_pfQueue = xQueueCreate(4, sizeof(PfReq));
+  if (!s_mu || !s_sdMu || !s_pfQueue)
+    Serial.println("WARN: prefetch sync primitives failed - cache disabled");
+}
+
+bool EpubBook::pfMine(int slot, uint32_t gen, uint16_t ch) const {
+  if (gen != m_gen) return false;
+  bool mine;
+  xSemaphoreTake(s_mu, portMAX_DELAY);
+  mine = (s_slot[slot].state == 2 && s_slot[slot].ch == (int16_t)ch);
+  xSemaphoreGive(s_mu);
+  return mine;
+}
+
+void EpubBook::pfFinish(int slot, uint32_t gen, uint16_t ch, bool ok) {
+  xSemaphoreTake(s_mu, portMAX_DELAY);
+  bool mine = (gen == m_gen && s_slot[slot].state == 2 &&
+               s_slot[slot].ch == (int16_t)ch);
+  if (mine) {
+    s_slot[slot].state = ok ? 1 : 0;
+    if (!ok) s_slot[slot].ch = -1;
+  }
+  xSemaphoreGive(s_mu);
+  // 不归我（换书/驱逐已完成）：状态已被别人接管，文件由新主人截断覆盖，什么都不做
+}
+
+// 预取任务体（core0）：独立 zip 实例 + XHTML 整条目进 PSRAM（免临时文件、不与主核
+// 撞名），解析/落盘阶段不碰 SD。任何阶段发现"槽位不归我这单"立即丢弃——期间可能
+// 已换书或跳转，半成品文件留给复用方截断。SD 读失败不自救（Storage::recover 是
+// 全局操作，留给主核同步路径统一处理），本单作废即可。
+bool EpubBook::pfConvert(uint16_t idx, int slot, uint32_t gen) {
+  uint32_t t0 = millis();
+  char* buf = nullptr;
+  size_t blen = 0;
+  bool ok = false;
+  {
+    SdMuGuard sdGuard;
+    EpubZip zip;   // miniz 流 per-instance，与主核 m_zip 并发互不干扰
+    if (zip.open(m_path))
+      ok = zip.extractToBuffer(m_chapterPath[idx], &buf, &blen, PF_MAX_XHTML);
+  }
+  if (!ok || !buf) { free(buf); return false; }
+  if (!pfMine(slot, gen, idx)) { free(buf); return false; }
+
+  char* start = buf;
+  if (blen >= 3 && (uint8_t)buf[0] == 0xEF && (uint8_t)buf[1] == 0xBB &&
+      (uint8_t)buf[2] == 0xBF)
+    start += 3;   // 去 UTF-8 BOM
+  sanitizeEntities(start);
+
+  ok = false;
+  {
+    XMLDocument doc;   // 析构在作用域尾：池块（PSRAM）随释放
+    if (doc.Parse(start) == XML_SUCCESS) {
+      char docDir[64];
+      dirOf(m_chapterPath[idx], docDir, sizeof(docDir));
+      TextSink sink;
+      if (sink.open(tempFs(), SLOT_PATH[slot])) {
+        collectText(&doc, sink, false, docDir);
+        sink.close();
+        ok = !sink.err();
+      }
+    }
+  }
+  free(buf);
+  if (!ok) return false;
+  if (!pfMine(slot, gen, idx)) return false;   // 写盘期间被换书/驱逐：结果作废
+  Serial.printf("[epub] prefetch ch%u -> slot%d ok (%lu ms)\n",
+                (unsigned)idx + 1, slot, (unsigned long)(millis() - t0));
+  return true;
+}
+
+void EpubBook::pfTask(void*) {
+  PfReq r;
+  for (;;) {
+    if (xQueueReceive(s_pfQueue, &r, portMAX_DELAY) != pdTRUE) continue;
+    EpubBook* self = s_pfBook;
+    if (!self) continue;
+    if (!self->pfMine(r.slot, r.gen, r.ch)) continue;   // 陈旧单：槽位已易主
+    bool ok = self->pfConvert(r.ch, r.slot, r.gen);
+    self->pfFinish(r.slot, r.gen, r.ch, ok);
+  }
+}
+
 bool EpubBook::open(const char* path) {
-  // 换书重开：同一本且已开 → 直接复用；不同书 → 全量重置
+  // 换书重开：同一本且已开 → 直接复用（槽位缓存同样有效）；不同书 → 全量重置
   static char s_openPath[64] = "";   // 与 LibEntry.path 同宽，长路径截断会误判"同一本"
   if (m_ok && strcmp(s_openPath, path) == 0) return true;
+  pfEnsure();                        // 双核预取设施（互斥量/队列/core0 任务）惰性建立
+  SdMuGuard sdGuard;                 // open 全程持 SD 锁（含 loadChapter 同步解压）
+  m_gen++;                           // 旧书在飞的预取单全部判陈旧
+  clearSlots();                      // 槽位文本随上一本书作废
   m_zip.close();
   m_ok = false;
   m_chapterDone = false;
@@ -361,6 +653,8 @@ bool EpubBook::open(const char* path) {
 // 切书/重挂前关句柄（Book::close）。进度状态（m_pairStart/章号/页号）保留，
 // 调用方 saveProgress() 切书前照常读得到。
 void EpubBook::close() {
+  m_gen++;              // 在飞预取判陈旧：finalize 时发现"不归我"即放手
+  clearSlots();         // 槽位文本随书关闭作废（含文件删除）
   m_txt.close();
   m_zip.close();
   m_ok = false;
@@ -379,6 +673,7 @@ void EpubBook::close() {
 //   ② 关全部 SD 句柄 → Storage::recover()（end+begin，卡走 CMD0 重新初始化）
 //   ③ 重开 zip 重试解压：成功 = 重挂救得回（固件可自救）；失败 = SD 不可用
 bool EpubBook::extractWithRecovery(const char* zipPath, const char* outPath) {
+  SdMuGuard sdGuard;   // SD 访问串行（递归：open() 全程持锁时再取不互斥）
   if (m_sdDead) return false;               // 本会话已判死：不再探 SD（防连环超时）
 
   if (m_zip.extractToFile(zipPath, outPath, tempFs())) return true;
@@ -519,18 +814,20 @@ bool EpubBook::parseOpf(const char* opfPath) {
   return true;
 }
 
-// XHTML 临时文件 → 纯文本临时文件（tinyxml2 为主，剥标签兜底）
+// XHTML 临时文件 → 纯文本临时文件（tinyxml2 为主，剥标签兜底）。
 // docDir = 本章 XHTML 所在 zip 内目录（插图 href 相对它解析，含尾 '/'）
-bool EpubBook::convertChapterToText(const char* docDir) {
-  File xf = tempFs().open(TEMP_XHTML, FILE_READ);
+// 主核同步路径与 core0 预取任务共用（路径参数化，互不撞文件）。
+bool EpubBook::convertChapterToText(const char* docDir, const char* xhtmlPath,
+                                    const char* txtPath) {
+  File xf = tempFs().open(xhtmlPath, FILE_READ);
   if (!xf) return false;
   size_t xsize = xf.size();
   xf.close();
 
-  char* buf = readFileToPsram(tempFs(), TEMP_XHTML, NULL);
+  char* buf = readFileToPsram(tempFs(), xhtmlPath, NULL);
   if (!buf) {
     Serial.println("WARN: chapter too big for RAM - naive strip fallback");
-    return naiveStripToText(TEMP_XHTML, TEMP_TXT);
+    return naiveStripToText(xhtmlPath, txtPath);
   }
   // 去 UTF-8 BOM
   char* start = buf;
@@ -544,7 +841,7 @@ bool EpubBook::convertChapterToText(const char* docDir) {
     XMLDocument doc;                    // 析构在作用域尾：池块（PSRAM）随释放
     if (doc.Parse(start) == XML_SUCCESS) {
       TextSink sink;
-      if (sink.open(tempFs(), TEMP_TXT)) {
+      if (sink.open(tempFs(), txtPath)) {
         collectText(&doc, sink, false, docDir);
         sink.close();
         ok = !sink.err();          // 临时文件写停摆 → 文本不完整 → 判坏章
@@ -556,42 +853,41 @@ bool EpubBook::convertChapterToText(const char* docDir) {
     }
   }
   free(buf);
-  if (!ok) return naiveStripToText(TEMP_XHTML, TEMP_TXT);
+  if (!ok) return naiveStripToText(xhtmlPath, txtPath);
 
-  File tf = tempFs().open(TEMP_TXT, FILE_READ);
+  File tf = tempFs().open(txtPath, FILE_READ);
   size_t tsize = tf ? tf.size() : 0;
   if (tf) tf.close();
-  Serial.printf("[epub] chapter %u: xhtml %uB -> text %uB, %lu ms | psram free=%u\n",
-                m_chapter, (unsigned)xsize, (unsigned)tsize,
+  Serial.printf("[epub] chapter: xhtml %uB -> text %uB, %lu ms | psram free=%u\n",
+                (unsigned)xsize, (unsigned)tsize,
                 (unsigned long)(millis() - t0), (unsigned)ESP.getFreePsram());
   return tsize > 0;
 }
 
-// 解压一章 + 转文本 + 交给 TxtBook。false = 本章坏（调用方跳过）
+// 解压一章 + 转文本 + 交给 TxtBook。false = 本章坏（调用方跳过）。
+// 双核缓存（DESIGN §13）：槽位 READY 命中 = 打开文件（毫秒级，跨章翻页/回退的
+// 常见路径）；未命中由 acquireSlot 走同步解压转换（原慢路径，几秒到十几秒）。
 bool EpubBook::loadChapter(uint16_t idx) {
   if (idx >= m_nChapters) return false;
-  m_txt.close();   // 先关旧句柄：TextSink 马上以 FILE_WRITE 截断重写同一临时文件，
+  m_txt.close();   // 先关旧句柄：槽位文件马上被新章占用/复用（FILE_WRITE 截断），
                    // 两处同开一个文件不干净；转换失败时旧章文本也别留在渲染路径上
-  extractWithRecovery(m_chapterPath[idx], TEMP_XHTML) ||
-      Serial.printf("WARN: extract failed: %s\n", m_chapterPath[idx]);
 
-  // 本章 XHTML 所在 zip 内目录（插图 href 相对它解析）
-  char docDir[64] = "";
-  {
-    const char* slash = strrchr(m_chapterPath[idx], '/');
-    if (slash) {
-      size_t n = (size_t)(slash - m_chapterPath[idx]) + 1;
-      if (n >= sizeof(docDir)) n = sizeof(docDir) - 1;
-      memcpy(docDir, m_chapterPath[idx], n); docDir[n] = '\0';
-    }
-  }
-
-  bool ok = convertChapterToText(docDir);
-  tempFs().remove(TEMP_XHTML);
-  if (!ok) return false;
+  const uint32_t t0 = millis();
+  int slot = acquireSlot(idx);
+  if (slot < 0) return false;
 
   m_txt.setQuiet(true);            // 章节切换频繁，头部 dump 会刷屏（须在 open 前）
-  if (!m_txt.open(tempFs(), TEMP_TXT)) return false;
+  if (!m_txt.open(tempFs(), SLOT_PATH[slot])) {
+    xSemaphoreTake(s_mu, portMAX_DELAY);
+    if (s_slot[slot].state == 1 && s_slot[slot].ch == (int16_t)idx) {
+      s_slot[slot].state = 0; s_slot[slot].ch = -1;   // 槽文件打不开：视为无效
+    }
+    xSemaphoreGive(s_mu);
+    return false;
+  }
+  m_curSlot = slot;
+  Serial.printf("[epub] load ch%u slot%d (%lu ms)\n",
+                (unsigned)idx + 1, slot, (unsigned long)(millis() - t0));
   m_txt.setLoop(false);            // 章末停住，由本类推进下一章
   m_txt.setTier(m_tier);
   m_txt.setFamily(m_family);
@@ -601,6 +897,7 @@ bool EpubBook::loadChapter(uint16_t idx) {
   m_txt.setTitle(hdr);
   m_chapter = idx;
   m_chapterDone = false;
+  kickAdjacent();      // 预取前后章（core0 空闲时跑；命中后下一次翻章 = 开文件）
   return true;
 }
 
@@ -695,7 +992,11 @@ bool EpubBook::renderPair(uint8_t* fbL, uint8_t* fbR) {
 
 bool EpubBook::restartPair() {
   if (!m_ok || m_pairStart < 0) return false;
-  if (m_pairStartCh != m_chapter && !loadChapter(m_pairStartCh)) return false;
+  if (m_pairStartCh != m_chapter) {
+    if (!loadChapter(m_pairStartCh)) return false;
+    invalidateOtherSlots();   // 跨章回退同 jump：邻章缓存指向旧位置，清掉重填
+    kickAdjacent();
+  }
   m_chapterDone = false;
   m_page = m_pairStartPage;
   return m_txt.restorePair(m_pairStart, m_pairStartPage);
@@ -874,7 +1175,7 @@ bool EpubBook::ensureChSizes() {
   if (m_sizesOk) return true;
   memset(m_chSize, 0, sizeof(m_chSize));
   m_totalSize = 0;
-  m_zip.forEach(chSizeCb, this);
+  { SdMuGuard g; m_zip.forEach(chSizeCb, this); }   // SD 访问串行（预取任务并发）
   m_sizesOk = true;
   return m_totalSize > 0;
 }
@@ -920,6 +1221,8 @@ bool EpubBook::jumpPermille(uint16_t p) {
     cum += m_chSize[i];
   }
   if (!loadChapter(ch)) return false;
+  invalidateOtherSlots();   // 旧位置的邻章缓存对新位置无意义：清掉让 kick 重填
+  kickAdjacent();
   m_chapterDone = false;
   long ts = m_txt.textSize();
   long off = 0;
@@ -950,6 +1253,8 @@ bool EpubBook::jumpToToc(int idx) {
     ch = (uint16_t)idx;                  // 合成目录 = 章号直跳
   }
   if (ch >= m_nChapters || !loadChapter(ch)) return false;
+  invalidateOtherSlots();   // 同 jumpPermille：旧邻章缓存作废，kick 重填新邻章
+  kickAdjacent();
   m_chapterDone = false;
   // 页号估计：章首的进度% × 全书估计页数
   ensureChSizes();

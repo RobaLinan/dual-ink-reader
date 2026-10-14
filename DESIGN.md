@@ -24,7 +24,7 @@ SD 卡（SDMMC 1-bit，4-bit 实测不稳，见 §5.7）：
 > P3 实测教训（2026-09-24）：SD CMD 误接 GPIO29 → `sdmmc_init_ocr` 0x107
 > （卡无应答）。26-32 是 N16R8 内部 Flash 引脚，硬件占死，任何外设都不能用。
 
-编译 FQBN：`esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB`
+编译 FQBN：`esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc`
 > 分区表实际以 sketch 根目录 **`partitions.csv`** 为准（platform.txt prebuild 钩子
 > source > variant > build.partitions 自动覆盖菜单项）——菜单选 `app3M_fat9M_16MB`
 > 只为借它的 `upload.maximum_size=3MB` 做体积上限检查。详见坑 22。
@@ -439,12 +439,34 @@ bug 已修（坑 21）→ 复烧回归通过）**：
     default 表下已 75% 快顶）。验证：解码构建缓存 `eink.ino.partitions.bin`
     确认 `spiffs @0x610000/10112K`。
 
+23. **EPUB 跨章卡顿的两个根因（2026-10-13 定案，§13）**：① 同章回退无条件重载
+    ——`restorePair` 里 `ch >= m_nChapters || !loadChapter(ch)` 对合法章号短路求值，
+    **每次回退都重新解压+解析整章**（commit b60ebb0 修：仅 `ch != m_chapter` 才载）；
+    ② 跨章转换本身几秒到十几秒（解压+DOM+落盘落在按键路径上）→ core0 三槽预取
+    消化（§13）。TXT 无感只因它的 restorePair 只 seek——排查"翻页慢"先分同章/跨章。
+
+24. **FQBN 漏 `CDCOnBoot=cdc` = 串口静默（2026-10-14）**：esp32s3 板型默认
+    `CDCOnBoot=Disabled`（boards.txt），`Serial` 走 UART0 引脚不进 USB——症状是
+    烧录"成功"但 USB 串口一行都没有（连 boot 日志都像消失，ROM 消息走
+    USB-Serial-JTAG 通道，取决于监视器打开时机）。IDE 用户靠 Tools 菜单存了
+    "Enabled"不察觉，arduino-cli 裸 FQBN 必现。**所有编译命令必须带
+    `CDCOnBoot=cdc`**（§6 与文首 FQBN 已补）。排查"没输出"先怀疑这个，别怀疑固件。
+
+25. **WiFi 连接期间 `xTaskCreatePinnedToCore` 跨核建任务 = 永久自旋（2026-10-14
+    定案，§13）**：IDF 4.4 双核 FreeRTOS 向另一核挂任务要拿跨核 scheduler 自旋锁；
+    WiFi 连接在 core0 跑长临界区（关 cache/flash）时，core1 的获取永远转不完 →
+    loopTask 与 idle1 同核全被饿死 → **无输出、无 panic、连任务看门狗都不触发**
+    （TWDT 靠 idle 喂），表象与"硬件卡死"无法区分。三个实锤特征：① 无任务代码
+    A/B 正常；② 卡死点随机漂移（加打印延迟就挤过去）；③ 拔卡/换卡无影响。
+    → **所有 core0 常驻任务必须在 `net.begin()` 之前（setup 最早段）创建**，
+    此后永不再建（`EpubBook::prefetchInit()` 幂等，eink.ino setup 调用）。
+
 ## 6. 本地工具
 - **漫画 EPUB 对页合并**：`python3 tools/pair_manga_epub.py <in.epub> <out.epub>`
   （calibre 类一图一章的漫画 EPUB → 连续单图章两两合并成一章，双屏一屏对页
   正好左右面板各一页；svg 封面页/文字章不合并。需配合 §12 固件改动，
   2026-10-13）
-- 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB '/home/roba/Nutstore Files/我的坚果云/Projects/Personal/eink'`
+- 编译：`~/.local/bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc '/home/roba/Nutstore Files/我的坚果云/Projects/Personal/eink'`
 - 竖版页离屏回归（不接硬件，§3.7）：`GUI=$HOME/Arduino/libraries/ESP32epdx/src/GUI g++ -std=c++17 -I"$GUI" tools/rot_layout_test.cpp "$GUI/GUI_Paint.cpp" "$GUI/font16.cpp" -o /tmp/rot_layout_test && /tmp/rot_layout_test`
   （断言逻辑画布 480×648、最坏排版零越界、页顶朝右；改动排版常量后跑一下）
 - 字库生成：`python3 tools/mk_unifont.py`（源 `unifont_all.hex` → `assets/fonts/unifont.bin`，已生成）
@@ -465,7 +487,7 @@ bug 已修（坑 21）→ 复烧回归通过）**：
   （合盖 300ms 深睡 / EXT1 开盖唤醒 / RGB 48 可视判定；极性反了改 `HALL_CLOSED_LEVEL`）
 - 资料：`~/Downloads/Gdey0583T81/`（屏规格书 + UC8179 数据手册 + 官方 demo 压缩包）
 
-## 7. 双核并行备忘（2026-09-24 讨论 · 未采用，P4 按数据再评估）
+## 7. 双核并行备忘（2026-09-24 讨论 · 页级预取未采用；**章级预取 2026-10-13 已落地，见 §13**）
 
 **问题**：要不要 core0 读 SD、core1 渲染？
 
@@ -507,6 +529,11 @@ PSRAM 无压力），前台 loop 只 present + 换挡，换挡点一道栅栏。
 1. 现在：不动（单线程 1.36s/页，达标 ≤1.8s）
 2. P4 实测单页渲染 >100–200ms 或章节首页卡顿明显 → 先上"BUSY 期间渲染下一页"
 3. 仍不够 → 再上 core0 预取任务（上面的单写者设计），收益门槛到了再付复杂度
+
+**回看（2026-10-13）**：门槛以另一种形式到了——不是单页渲染慢（50–73ms 依旧），
+而是**跨章转换**（几秒到十几秒）落在按键路径上。落地的是更保守的切口：
+core0 预取"转换后的章文本"（三槽轮换），不碰 Paint/帧缓冲，单写者约束原封不动。
+页级渲染预取（本节原设计）仍不做，BUSY 期间渲染下一页（中间方案）也不需要了。
 
 ## 8. 系统菜单与网络服务（2026-09-28 新增，src/NetSvc.* + src/SysMenu.*）
 
@@ -737,3 +764,50 @@ include "DbgLog.h"（各 .cpp 放**最后一条 include**，库头先展开，�
 （tools/pair_manga_epub.py 的文本流 + TxtBook 分页规则复刻）：93 合并章全部
 img|img 满对，仅封面右页与奇数尾页右页共 2 张空白页，符合预期。
 **屏上待验收**：合并后的漫画 EPUB 左右配对、翻页连续、章末不卡。
+
+## 13. 双核章节缓存：跨章翻页毫秒级（2026-10-13 新增，src/EpubBook.* + src/EpubZip.* + src/DbgLog.cpp）
+
+**问题（坑 23）**：EPUB 一章一转换 = zip 解压 + tinyxml2 整章 DOM + LittleFS 落盘，
+大章节几秒到十几秒。落在跨章翻页/回退的按键路径上 = 可感知卡顿（TXT 只 seek 故无感）。
+2026-10-13 先修掉同章回退无条件重载（`restorePair` 仅跨章才 `loadChapter`，commit
+b60ebb0），跨章的转换成本本体由本节缓存消化。
+
+**定案**：core0 预取任务（`epubpf`，8KB 栈，优先级 1）把**当前章前后各一章**提前
+转换进 **3 个 LittleFS 槽位**（`/__s0..2.txt`，≤444KB×3≈1.3MB，9.9MB spiffs 分区
+无压力）轮换；主核 `loadChapter` 命中 READY 槽 = 打开文件（毫秒级），未命中才走
+原同步路径（行为同无缓存）。这是 §7 讨论的落地，但切口比"整页预取"更保守：
+**缓存单元 = 转换后的章文本**，不碰 Paint/帧缓冲/单写者约束，字号切换无需作废。
+
+**槽位状态机**（`s_mu` 保护）：IDLE→WRITING→READY。
+- WRITING 绝不驱逐：恰是目标章就等它就绪（翻章撞预取最常见），否则等落定再重选；
+- 当前章槽（m_txt 正开着）绝不驱逐/复用；
+- 无 IDLE 时驱逐"离目标章最远"的 READY 槽（持续前进/后退时缓存始终指着行进方向）；
+- 换书/关闭 = 代际 m_gen 自增 + 清槽，在飞预取单经 (gen,slot,ch) 三重校验自然作废；
+- 半成品文件由复用方 FILE_WRITE 截断覆盖，无需清理协议。
+
+**预取任务体**（`pfConvert`）：独立 `EpubZip` 实例（miniz 流 per-instance）+
+`extractToBuffer`（新：块回调累积进 PSRAM 增长缓冲，≤2MB 上限——实测有书单章
+1.2MB，1MB 会整章放弃；免临时文件、不与主核 `__e.xhtml` 撞名竞争）→ BOM/实体
+预处理 → tinyxml2 解析 → TextSink 写槽位。
+SD 读失败**不自救**（Storage::recover 是全局操作，留给主核同步路径统一处理），
+本单作废即可；解析失败同理（不做剥标签兜底——那是主核路径的降级）。
+
+**SD 串行 = s_sdMu 递归互斥**：ESP-IDF 4.4 的 SDMMC 卡命令路径没有会话锁，双核
+并发戳卡会互踩命令。所有 zip/SD 访问持锁：extractWithRecovery（含自救）、
+ensureChSizes 的 forEach、open() 全程、预取解压。LittleFS/PSRAM 分配器自身线程
+安全，不加锁（core0 写 flash 的关 cache 窗口只带来毫秒级抖动）。
+
+**门控**（任一命中则不预取，翻章退回同步路径）：WiFi 开（core1 可能在服务网页
+读 SD）、CJK 字库流式模式（渲染期也在读 SD）。DbgLog 环形缓冲加 portMUX
+临界区（原来无锁，双核并发打日志会互踩）。
+
+**观测点**：`[epub] prefetch chN -> slotM ok (xxx ms)`（core0 完成）、
+`[epub] load chN slotM (xxx ms)`（主核，命中应 ≈ 开文件时间）、
+`[epub] chN cache wait xxx ms`（撞预取等待）。`[epub] chapter: ... psram free=`
+照常打，盯大章节转换时 PSRAM 余量（unifont 2MB + DOM 峰值 + 渲染缓冲共存）。
+
+**验收状态**：编译零警告 ✅；2026-10-14 实机定论——"开机卡住"实为**开机恢复到
+1.2MB 单章 XHTML 的阅读位置**（解压 17.6s + DOM 解析更久，全程几十秒无输出，
+旧固件同路径同慢，非本缓存引入）；b60ebb0 A/B 对照开机正常（该书 ch0 是 250B
+封面，不代表整书快）。硬件/SD/双核并发全部排除嫌疑。屏上待验收：跨章翻页命中
+缓存（`load chN slotM (毫秒级)`）与 WiFi 开关门控。

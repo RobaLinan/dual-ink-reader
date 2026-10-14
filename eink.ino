@@ -75,7 +75,8 @@
 // === 引脚分配（DESIGN §1.1）===
 #define EINK_SCK   12
 #define EINK_MOSI  11
-// 左屏
+// 左屏（2026-10-13 左屏时好时坏/BUSY 超时：加焊 VCC+BUSY 后修复，
+// 根因 = 虚焊。BUSY 已配 INPUT_PULLUP、SPI 降到 4MHz 见 src/EinkPanel.h）
 #define PIN_L_CS   14
 #define PIN_L_DC   15
 #define PIN_L_RST  16
@@ -112,7 +113,7 @@ RTC_DATA_ATTR bool s_sleepMenu = false;      // 入睡时菜单还开着：屏�
 RTC_DATA_ATTR bool s_sleepHome = false;      // 入睡时主页开着：屏上是选书页 → 开盖
                                              // 走全刷回主页（书的进度已按 NVS 恢复）
 
-static const uint32_t FULL_EVERY = 5;        // 每 5 次快刷插 1 次全刷
+static uint32_t FULL_EVERY = 5;        // 每 N 次快刷插 1 次全刷（系统菜单可调 5-15）
 static const uint32_t PAGE_INTERVAL_MS = 5000;
 static const uint32_t FAST_TARGET_MS = 1800; // 验收线：整页 ≤1.8s
 static const uint32_t SAVE_EVERY_PAIRS = 10; // 进度落盘频率（对页数）
@@ -360,6 +361,8 @@ static void dbgFillInfo(NetSvc::DbgInfo& i);
 static void dbgResetPanel(bool leftSide);
 static void dbgForceRefresh();
 static void dbgFlip(int delta);
+// 系统菜单"全刷间隔"回调（setup 里挂到 menu）
+static void cycleFullEvery();
 
 // 一轮：出内容 → 刷新 → 计时统计 → 双缓冲换挡
 static void runRefresh(bool fullMode) {
@@ -437,6 +440,14 @@ static void openSysMenu() {
   if (menu.isOpen()) return;
   menu.open();
   showMenuRefresh(true);
+}
+
+// 系统菜单"全刷间隔"项：每次执行 +1，5→6→...→15→5 循环，落 NVS
+static void cycleFullEvery() {
+  FULL_EVERY = (FULL_EVERY >= 15) ? 5 : FULL_EVERY + 1;
+  menu.fullEvery = FULL_EVERY;
+  prefs.putUInt("fullEv", FULL_EVERY);
+  Serial.printf("[sys] full refresh every %lu fast cycles\n", (unsigned long)FULL_EVERY);
 }
 
 // 主页入口（Menu 短按 / 串口 n）：选中项落到正在读的那本
@@ -655,6 +666,10 @@ void setup() {
                 (unsigned)ESP.getFreeHeap());
   prefs.begin("eink-book");
 
+  // EPUB core0 预取：建同步原语（mutex/queue），core0 任务延迟到 kickAdjacent()
+  // 首次调用且 WiFi 关闭时才创建（坑 25：WiFi 连接期间向 core0 建任务 = 死锁）
+  EpubBook::prefetchInit();
+
   // 系统网络服务（菜单后端）：自带 NVS 命名空间 "eink-net"，WiFi 默认关
   // （DESIGN §2 省电定案；菜单里手动开）。上传/删除完成回调重扫书库；
   // /debug 调试台回调（状态注入 + 复位面板/重画/翻页，DESIGN §11）
@@ -665,6 +680,9 @@ void setup() {
   net.onDbgRefresh = dbgForceRefresh;
   net.onDbgFlip = dbgFlip;
   net.begin();
+  menu.onFullEvery = cycleFullEvery;     // 系统菜单"全刷间隔"回调
+  FULL_EVERY = prefs.getUInt("fullEv", 5);   // NVS 恢复（默认 5）
+  menu.fullEvery = FULL_EVERY;
 
   fbShownL = allocFrame();
   fbDrawL = allocFrame();
@@ -770,6 +788,19 @@ void setup() {
     bool restored = false;
     if (pos >= 0) restored = restoreAt(pos, pg, ch);
     if (!restored) book->restartPair();   // 无有效存档：从第 0 对页开始
+  }
+  // 预填历史栈：让 Prev 键能回退到开机恢复点之前
+  // 保存当前位置 → jumpPermille 跳到更早位置 → 推入历史 → restoreAt 回原位
+  if (bookOk && book && book->pairFilePos() > 0) {
+    long curPos = book->pairFilePos();
+    uint32_t curPg = book->pairPageNo();
+    int16_t curCh = bookIsEpub ? (int16_t)epub.pairChapter() : (int16_t)-1;
+    histPush();   // 当前位置入栈（Prev 第一下回这里）
+    for (int p = 10; p < 100 && p < (int)book->permille(); p += 10) {
+      book->jumpPermille((uint16_t)p);
+      histPush();
+    }
+    restoreAt(curPos, curPg, curCh);
   }
   if (!resumed) {
     if (sleptWithHome) {

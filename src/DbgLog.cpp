@@ -14,6 +14,10 @@ DbgSerialProxy DbgSerial;
 static const size_t kRingSize = 32768;   // PSRAM 环形缓冲 ≈ 最近几百行日志
 static const uint32_t kDumpMax = 8192;   // /debug/log 单次最大返回字节
 
+// 双核互斥：core0 预取任务（EpubBook，DESIGN §13）与主核会并发打日志。
+// portMUX 只保证字节级不撕裂；行级交错仍可能（两核同时各写一行），可接受。
+static portMUX_TYPE s_logMux = portMUX_INITIALIZER_UNLOCKED;
+
 DbgSerialProxy::DbgSerialProxy()
     : m_uart(s_realUart), m_ring(nullptr), m_cap(0), m_head(0), m_seq(0),
       m_lineStart(true) {}
@@ -51,7 +55,16 @@ int DbgSerialProxy::printf(const char* fmt, ...) {
 }
 
 void DbgSerialProxy::mirror(uint8_t b) {
-  if (!m_ring && !(m_ring = (uint8_t*)ps_malloc(kRingSize))) return;  // PSRAM 没了就只留真 UART
+  if (!m_ring) {   // PSRAM 分配放临界区外（堆锁在关中断里拿会spin太久）
+    uint8_t* r = (uint8_t*)ps_malloc(kRingSize);
+    uint8_t* loser = nullptr;
+    portENTER_CRITICAL(&s_logMux);
+    if (!m_ring) m_ring = r; else loser = r;
+    portEXIT_CRITICAL(&s_logMux);
+    free(loser);
+    if (!m_ring) return;   // PSRAM 没了就只留真 UART
+  }
+  portENTER_CRITICAL(&s_logMux);
   if (!m_cap) m_cap = kRingSize;
   if (m_lineStart && b != '\n') {   // 行首注入 [ms] 时间戳（只进缓冲不进 UART）
     char ts[16];
@@ -67,6 +80,7 @@ void DbgSerialProxy::mirror(uint8_t b) {
   m_head = (m_head + 1) % m_cap;
   m_seq++;
   if (b == '\n') m_lineStart = true;
+  portEXIT_CRITICAL(&s_logMux);
 }
 
 void DbgSerialProxy::dump(String& out, uint32_t since, uint32_t& next) {
@@ -79,10 +93,13 @@ void DbgSerialProxy::dump(String& out, uint32_t since, uint32_t& next) {
   uint32_t n = m_seq - since;
   out.reserve(n + 48);
   if (clipped) out += F("……（更早日志已滚出环形缓冲）……\n");
+  portENTER_CRITICAL(&s_logMux);   // 拷贝期关中断：防 core0 并发写撕裂读
+  uint32_t seqNow = m_seq;
   uint32_t off = since % m_cap;   // 环形拷贝（最多绕回一次），NUL 跳过（String 装不下）
   for (uint32_t i = 0; i < n; i++) {
     uint8_t c = m_ring[(off + i) % m_cap];
     if (c) out += (char)c;
   }
-  next = m_seq;
+  portEXIT_CRITICAL(&s_logMux);
+  next = seqNow;
 }

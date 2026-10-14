@@ -24,10 +24,16 @@ namespace tinyxml2 { class XMLElement; }
 // 量高度占位，页中放不下整图推下页，页首硬压进一页。GIF/WebP/渐进 JPEG 跳过。
 // 峰值 RAM = 章节缓冲 + DOM（都 PSRAM，DOM 池块打了 PSRAM 补丁见 VENDOR.md），
 // 解析完即释放；验收线：>280KB 章节读完一章不崩不 OOM。
+//
+// 双核章节缓存（DESIGN §13，2026-10-13）：loadChapter 同步路径（解压+解析+落盘）
+// 大章节几秒到十几秒，core0 全程闲着 → 后台预取任务把前/后章提前转换进 3 个
+// LittleFS 槽位轮换，主核命中 = 打开文件（毫秒级）。槽位状态机与并发约束见
+// cpp 文件"双核章节缓存"一节。
 
 class EpubBook : public Book {
 public:
   static const uint16_t MAXCH = 256;   // spine 章数上限（防御）
+  static const int NSLOT = 3;          // 章节缓存槽位数（文本，见 DESIGN §13）
 
   bool open(const char* path) override;
   bool isOpen() const override { return m_ok; }
@@ -61,12 +67,43 @@ public:
   // zip 条目 → spine 章号（-1 = 不是章节；forEach 回调/目录匹配共用）
   int chapterIndexOf(const char* zipPath) const;
 
+  // setup() 早期（net.begin 启动 WiFi 之前）调用一次：建同步原语（mutex/queue）。
+  // core0 任务延迟到 pfEnsure()（由 kickAdjacent 调用、WiFi 关闭时）创建 ——
+  // WiFi 连接期间 xTaskCreatePinnedToCore 向 core0 挂任务会撞跨核 scheduler
+  // 自旋锁，导致开机卡死（坑 25）
+  static void prefetchInit();
+
 private:
-  bool loadChapter(uint16_t idx);      // 解压+解析+抽文本+交给 TxtBook
+  bool loadChapter(uint16_t idx);      // 命中槽位直接开文件；未命中走同步转换
   bool nextChapter();                  // 推进一章（读完回卷第一章）
   bool parseOpf(const char* opfPath);  // 解析 OPF：标题/manifest/spine + 目录(NCX/nav)
-  bool convertChapterToText(const char* docDir);  // XHTML 临时文件 → 纯文本临时文件
+  bool convertChapterToText(const char* docDir, const char* xhtmlPath,
+                            const char* txtPath);   // XHTML 临时文件 → 纯文本临时文件
   bool extractWithRecovery(const char* zipPath, const char* outPath);  // 解压 + SD 读自救
+
+  // —— 双核章节缓存（DESIGN §13）：core0 预取任务预转换前后章，翻章 = 开文件 ——
+  struct SlotState { int8_t state; int16_t ch; };  // 0=IDLE 1=READY 2=WRITING；ch=-1 无
+  struct PfReq { uint32_t gen; uint16_t ch; int8_t slot; };
+  struct SdMuGuard;                     // SD 访问锁 RAII（递归互斥，定义在 cpp）
+
+  int acquireSlot(uint16_t idx);        // 主核：READY 命中 / 等预取落定 / 驱逐 + 同步转换
+  bool syncConvert(uint16_t idx, int slot);        // 主核慢路径（extractWithRecovery）
+  void evictSlot(int slot);             // READY → IDLE（文件不删，复用时 FILE_WRITE 截断）
+  void clearSlots();                    // 全清 + 删槽位文件（open/close 换书时）
+  void invalidateOtherSlots();          // 跳转后清非当前章槽位（WRITING 不动）
+  void kickAdjacent();                  // 主核：前后章预取入队（WiFi/流式字库门控）
+  void pfEnsure();                      // 惰性建 s_mu/s_sdMu/队列/core0 任务
+  bool pfMine(int slot, uint32_t gen, uint16_t ch) const;  // 任务：槽位仍归我这单？
+  bool pfConvert(uint16_t idx, int slot, uint32_t gen);    // 预取任务体（core0）
+  void pfFinish(int slot, uint32_t gen, uint16_t ch, bool ok);
+  static void pfTask(void* arg);
+
+  static SemaphoreHandle_t s_mu;        // 槽位状态互斥
+  static SemaphoreHandle_t s_sdMu;      // SD 访问串行（递归）
+  static TaskHandle_t s_pfTask;         // core0 预取任务（单例）
+  static QueueHandle_t s_pfQueue;       // 预取请求队列（深度 4）
+  static SlotState s_slot[NSLOT];       // 槽位状态表
+  static EpubBook* s_pfBook;            // 任务上下文（固件单书假设）
 
   // 目录（EPUB2 NCX / EPUB3 nav.xhtml；都没有 → tocCount 退化为"第N章"合成目录）
   bool parseNcxToc(const char* zipPath, const char* baseDir);
@@ -114,6 +151,8 @@ private:
   char m_chapterPath[MAXCH][64];       // 每章 zip 内路径（256×64B = 16KB RAM）
   char m_path[64] = "";                // 当前书路径（SD 重挂后重开 zip 用）
   bool m_sdDead = false;               // 读探针判死：本会话不再探 SD（防连环超时）
+  int8_t m_curSlot = -1;               // m_txt 正打开的文本槽（-1 = 无）
+  uint32_t m_gen = 0;                  // 书会话代际：open/close 自增，预取单陈旧判据
   char m_imgPath[160] = "";            // 已解压进 TEMP_IMG 的 zip 路径（缓存键）
   bool m_imgCached = false;
   bool m_imgOk = false;
